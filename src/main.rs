@@ -2,13 +2,19 @@
 
 mod util;
 
-use std::{thread, time::Duration};
+use std::{fs::File, io, path::PathBuf, thread, time::Duration};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use evdev_rs::{
-    enums::{BusType, EventCode, InputProp, EV_ABS::*, EV_KEY::*, EV_SYN::*},
-    DeviceWrapper, UInputDevice, UninitDevice,
+    enums::{
+        BusType, EventCode, InputProp,
+        EV_ABS::*,
+        EV_KEY::{self, *},
+        EV_REL::*,
+        EV_SYN::*,
+    },
+    Device, DeviceWrapper, ReadFlag, UInputDevice, UninitDevice,
 };
 
 use util::{emit, enable_abs, enable_key, sync};
@@ -16,26 +22,41 @@ use util::{emit, enable_abs, enable_key, sync};
 /// Simulate a trackpad with your physical mouse.
 #[derive(Debug, Clone, clap::Parser)]
 struct Args {
+    /// Source device file to read mouse inputs from (e.g. `/dev/input/event1`).
+    #[arg(short, long)]
+    source: PathBuf,
     /// Number of fingers to simulate a swipe with.
     #[arg(short, long, default_value_t = 3)]
     fingers: usize,
 }
 
+/// Width and height of the simulated trackpad.
+const SIZE: i32 = u16::MAX as i32;
+
 fn main() -> Result<()> {
-    let Args { fingers } = Args::parse();
+    let Args { source, fingers } = Args::parse();
 
-    if !(2..=5).contains(&fingers) {
-        return Err(anyhow!("can only swipe with 2, 3, 4 or 5 fingers"));
-    }
-    let fingers = i32::try_from(fingers).unwrap();
+    let (fingers, btn_tool): (i32, _) = match fingers {
+        2 => (2, BTN_TOOL_DOUBLETAP),
+        3 => (3, BTN_TOOL_TRIPLETAP),
+        4 => (4, BTN_TOOL_QUADTAP),
+        5 => (5, BTN_TOOL_QUINTTAP),
+        _ => {
+            return Err(anyhow!("can only swipe with 2, 3, 4 or 5 fingers"));
+        }
+    };
 
-    let dev = create_virtual_trackpad()?;
+    let source = open_device(source).with_context(|| "failed to open source device")?;
+    let sink = create_virtual_trackpad().with_context(|| "failed to create virtual trackpad")?;
 
     eprintln!("Starting");
     thread::sleep(Duration::from_secs(3));
     eprintln!("Started");
 
-    // copied from my evemu recording
+    let mut x = SIZE / 2;
+    let mut y = SIZE / 2;
+
+    // start swipe
     /*
     E: 0.000001 0003 0039 8661	# EV_ABS / ABS_MT_TRACKING_ID   8661
     E: 0.000001 0003 0035 0690	# EV_ABS / ABS_MT_POSITION_X    690
@@ -56,19 +77,37 @@ fn main() -> Result<()> {
     E: 0.000001 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +0ms
      */
 
-    let start_x = 5000;
-
     for finger in 0..fingers {
-        emit(&dev, ABS_MT_SLOT, finger)?;
-        emit(&dev, ABS_MT_TRACKING_ID, finger)?;
-        emit(&dev, ABS_MT_POSITION_X, start_x)?;
-        emit(&dev, ABS_MT_POSITION_Y, 5000)?;
+        emit(&sink, ABS_MT_SLOT, finger)?;
+        emit(&sink, ABS_MT_TRACKING_ID, finger)?;
+        emit(&sink, ABS_MT_POSITION_X, x)?;
+        emit(&sink, ABS_MT_POSITION_Y, y)?;
     }
-    emit(&dev, BTN_TOUCH, 1)?;
-    emit(&dev, BTN_TOOL_TRIPLETAP, 1)?;
-    sync(&dev)?;
+    emit(&sink, BTN_TOUCH, 1)?;
+    emit(&sink, btn_tool, 1)?;
+    sync(&sink)?;
 
-    for i in 0..100 {
+    loop {
+        let (_status, input) = source
+            .next_event(ReadFlag::NORMAL | ReadFlag::BLOCKING)
+            .with_context(|| "failed to read next event from source device")?;
+
+        let do_write = match input.event_code {
+            EventCode::EV_REL(REL_X) => {
+                x += input.value;
+                true
+            }
+            EventCode::EV_REL(REL_Y) => {
+                y += input.value;
+                true
+            }
+            EventCode::EV_KEY(EV_KEY::BTN_0) => break, // TODO
+            _ => false,
+        };
+        if !do_write {
+            continue;
+        }
+
         /*
         E: 0.020080 0003 002f 0000	# EV_ABS / ABS_MT_SLOT          0
         E: 0.020080 0003 0035 0686	# EV_ABS / ABS_MT_POSITION_X    686
@@ -81,18 +120,15 @@ fn main() -> Result<()> {
         E: 0.020080 0004 0005 21000	# EV_MSC / MSC_TIMESTAMP        21000
         E: 0.020080 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
         */
-
-        let x = start_x + i * 2;
-
         for finger in 0..fingers {
-            emit(&dev, ABS_MT_SLOT, finger)?;
-            emit(&dev, ABS_MT_POSITION_X, x)?;
+            emit(&sink, ABS_MT_SLOT, finger)?;
+            emit(&sink, ABS_MT_POSITION_X, x)?;
+            emit(&sink, ABS_MT_POSITION_Y, y)?;
         }
-        sync(&dev)?;
-
-        thread::sleep(Duration::from_millis(10));
+        sync(&sink)?;
     }
 
+    // stop swipe
     /*
     E: 2.992985 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
     E: 3.000143 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
@@ -110,20 +146,24 @@ fn main() -> Result<()> {
     E: 3.007174 0004 0005 2948400	# EV_MSC / MSC_TIMESTAMP        2948400
     E: 3.007174 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
      */
-
     for finger in 0..fingers {
-        emit(&dev, ABS_MT_SLOT, finger)?;
-        emit(&dev, ABS_MT_TRACKING_ID, -1)?;
+        emit(&sink, ABS_MT_SLOT, finger)?;
+        emit(&sink, ABS_MT_TRACKING_ID, -1)?;
     }
-    emit(&dev, BTN_TOOL_FINGER, 0)?;
-    emit(&dev, BTN_TOOL_TRIPLETAP, 0)?;
-    sync(&dev)?;
+    emit(&sink, BTN_TOOL_FINGER, 0)?;
+    emit(&sink, btn_tool, 0)?;
+    sync(&sink)?;
 
     Ok(())
 }
 
+fn open_device(path: PathBuf) -> Result<Device> {
+    // https://github.com/ndesh26/evdev-rs/blob/master/examples/vmouse.rs
+    let file = File::open(path).with_context(|| "failed to open device file")?;
+    Device::new_from_file(file).with_context(|| "failed to create device from file")
+}
+
 fn create_virtual_trackpad() -> Result<UInputDevice> {
-    // Copied from my evemu recording of my laptop trackpad
     /*
     # Supported events:
     #   Event type 0 (EV_SYN)
@@ -211,31 +251,36 @@ fn create_virtual_trackpad() -> Result<UInputDevice> {
 
     let dev = UninitDevice::new().ok_or(anyhow!("failed to create uninit device"))?;
     dev.set_name("fukomaster virtual trackpad");
-    dev.set_bustype(BusType::BUS_USB as u16); // optional
+    dev.set_bustype(BusType::BUS_VIRTUAL as u16);
 
     // randomly generated IDs
     dev.set_vendor_id(0x4394);
     dev.set_product_id(0xd1fc);
 
-    // https://www.kernel.org/doc/html/v4.12/input/event-codes.html
-    // https://www.kernel.org/doc/html/v4.12/input/multi-touch-protocol.html
+    (|| {
+        // https://www.kernel.org/doc/html/v4.12/input/event-codes.html
+        // https://www.kernel.org/doc/html/v4.12/input/multi-touch-protocol.html
 
-    dev.enable(InputProp::INPUT_PROP_POINTER)?;
-    dev.enable(EventCode::EV_SYN(SYN_REPORT))?;
+        dev.enable(InputProp::INPUT_PROP_POINTER)?;
+        dev.enable(EventCode::EV_SYN(SYN_REPORT))?;
 
-    enable_key(&dev, BTN_TOOL_FINGER)?;
-    enable_key(&dev, BTN_TOUCH)?;
-    enable_key(&dev, BTN_TOOL_DOUBLETAP)?;
-    enable_key(&dev, BTN_TOOL_TRIPLETAP)?;
-    enable_key(&dev, BTN_TOOL_QUADTAP)?;
-    enable_key(&dev, BTN_TOOL_QUINTTAP)?;
+        enable_key(&dev, BTN_TOOL_FINGER)?;
+        enable_key(&dev, BTN_TOUCH)?;
+        enable_key(&dev, BTN_TOOL_DOUBLETAP)?;
+        enable_key(&dev, BTN_TOOL_TRIPLETAP)?;
+        enable_key(&dev, BTN_TOOL_QUADTAP)?;
+        enable_key(&dev, BTN_TOOL_QUINTTAP)?;
 
-    enable_abs(&dev, ABS_MT_SLOT, 4, 0)?; // max 5 touches
-    enable_abs(&dev, ABS_MT_TRACKING_ID, 65535, 0)?;
-    enable_abs(&dev, ABS_MT_TOOL_TYPE, 2, 0)?;
-    enable_abs(&dev, ABS_MT_POSITION_X, 10000, 12)?;
-    enable_abs(&dev, ABS_MT_POSITION_Y, 10000, 12)?;
+        enable_abs(&dev, ABS_MT_SLOT, 4, 0)?; // max 5 touches
+        enable_abs(&dev, ABS_MT_TRACKING_ID, 65535, 0)?;
+        enable_abs(&dev, ABS_MT_POSITION_X, SIZE, 1)?;
+        enable_abs(&dev, ABS_MT_POSITION_Y, SIZE, 1)?;
 
-    let dev = UInputDevice::create_from_device(&dev)?;
+        Ok::<(), io::Error>(())
+    })()
+    .with_context(|| "failed to initialize device")?;
+
+    let dev = UInputDevice::create_from_device(&dev)
+        .with_context(|| "failed to create initialized device")?;
     Ok(dev)
 }

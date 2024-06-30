@@ -41,7 +41,7 @@ TODO videos
 Tested on:
 - [x] Wayland
   - [x] GNOME 46
-- [ ] X
+- [ ] Xorg
   - TODO
 
 ### Packages
@@ -57,4 +57,4 @@ cargo run
 ## Etymology
 
 - `master`: because I wrote it for my MX Master 3S
-- `fuko`: iykyk :)
+- `fuko`: ヒトデです！
