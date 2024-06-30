@@ -2,6 +2,17 @@
 
 Simulate a trackpad with your physical mouse.
 
+<center>
+
+<video width="640" height="360" controls>
+  <source src="assets/demo.mp4" type="video/mp4">
+</video>
+
+*Using fukomaster with an MX Master 3S on GNOME with the
+[PaperWM](https://github.com/paperwm/PaperWM) tiling WM extension*
+
+</center>
+
 ## Motivation
 
 Mice like the [MX Master 3S] have a dedicated gesture button which can be used to activate desktop
@@ -28,10 +39,6 @@ Note that this doesn't just work with switching workspaces - you can use trackpa
 kinds of things, such as swiping right to go back in a web browser. You are, however, limited to the
 fact that all of your virtual fingers will be moving in the same direction at the same speed, so you
 can't, for example, simulate a pinch-and-zoom.
-
-## Demo
-
-TODO videos
 
 ## Usage
 
