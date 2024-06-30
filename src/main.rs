@@ -17,7 +17,7 @@ use evdev_rs::{
     Device, DeviceWrapper, GrabMode, ReadFlag, UInputDevice, UninitDevice,
 };
 
-use log::info;
+use log::{debug, info, warn};
 use util::{emit, enable_abs, enable_key, sync, Abs};
 
 /// Simulate a trackpad with your physical mouse
@@ -26,6 +26,15 @@ struct Args {
     /// Source device file to read mouse inputs from (e.g. `/dev/input/event1`)
     #[arg(short, long)]
     source: PathBuf,
+    /// `uinput` key code which activates swiping mode
+    ///
+    /// When this is pressed, the swiping mode is activated. When this is
+    /// released, the swiping mode is deactivated.
+    ///
+    /// Use `wev` to test which button on your mouse you want to use for
+    /// activation. For the MX Master 3S, the value is `277`.
+    #[arg(short, long, default_value_t = 277)]
+    trigger_key: u32,
     /// Number of fingers to simulate a swipe with
     #[arg(short, long, default_value_t = 3)]
     fingers: u8,
@@ -38,6 +47,13 @@ struct Args {
     /// device.
     #[arg(short, long, default_value_t = 12)]
     resolution: u16,
+    /// Disables grabbing the mouse cursor in `evdev` when swiping
+    ///
+    /// If grabbing is disabled, the mouse cursor will move with the virtual
+    /// trackpad when swiping, but may resolve issues with other processes
+    /// which also attempt to grab the mouse.
+    #[arg(long)]
+    no_grab: bool,
 }
 
 fn main() -> Result<()> {
@@ -45,9 +61,14 @@ fn main() -> Result<()> {
 
     let Args {
         source,
+        trigger_key,
         fingers,
         resolution,
+        no_grab,
     } = Args::parse();
+
+    let trigger_key =
+        evdev_rs::enums::int_to_ev_key(trigger_key).ok_or(anyhow!("invalid trigger key code"))?;
 
     let (fingers, btn_tool): (i32, _) = match fingers {
         2 => (2, BTN_TOOL_DOUBLETAP),
@@ -64,13 +85,20 @@ fn main() -> Result<()> {
     let mut source = open_device(source).with_context(|| "failed to open source device")?;
     let sink =
         create_virtual_trackpad(resolution).with_context(|| "failed to create virtual trackpad")?;
-    info!(
-        "Created virtual trackpad (devnode = {:?}, syspath = {:?})",
-        sink.devnode(),
-        sink.syspath()
-    );
+    info!("Created virtual trackpad");
+    info!("  devnode = {:?}", sink.devnode());
+    info!("  syspath = {:?}", sink.syspath());
 
-    simulate_trackpad(&mut source, &sink, Config { fingers, btn_tool })?;
+    simulate_trackpad(
+        &mut source,
+        &sink,
+        Config {
+            fingers,
+            trigger_key,
+            btn_tool,
+            grab: !no_grab,
+        },
+    )?;
 
     Ok(())
 }
@@ -172,7 +200,7 @@ fn create_virtual_trackpad(resolution: u16) -> Result<UInputDevice> {
     # Properties:
     #   Property  type 0 (INPUT_PROP_POINTER)
     #   Property  type 2 (INPUT_PROP_BUTTONPAD)
-     */
+    */
 
     let dev = UninitDevice::new().ok_or(anyhow!("failed to create virtual device"))?;
     dev.set_name("fukomaster virtual trackpad");
@@ -223,7 +251,9 @@ fn create_virtual_trackpad(resolution: u16) -> Result<UInputDevice> {
 #[derive(Debug, Clone, Copy)]
 struct Config {
     fingers: i32,
+    trigger_key: EV_KEY,
     btn_tool: EV_KEY,
+    grab: bool,
 }
 
 fn simulate_trackpad(source: &mut Device, sink: &UInputDevice, config: Config) -> Result<()> {
@@ -232,7 +262,12 @@ fn simulate_trackpad(source: &mut Device, sink: &UInputDevice, config: Config) -
         Swiping { x: i32, y: i32 },
     }
 
-    let Config { fingers, btn_tool } = config;
+    let Config {
+        fingers,
+        trigger_key,
+        btn_tool,
+        grab,
+    } = config;
     let mut state = State::Normal;
 
     loop {
@@ -241,9 +276,7 @@ fn simulate_trackpad(source: &mut Device, sink: &UInputDevice, config: Config) -
             .with_context(|| "failed to read next event from source device")?;
 
         match (&mut state, input.event_code, input.value) {
-            // BTN_FORWARD on MX Master 3S
-            // TODO configurable
-            (State::Normal, EventCode::EV_KEY(EV_KEY::BTN_FORWARD), 1) => {
+            (State::Normal, EventCode::EV_KEY(key), 1) if key == trigger_key => {
                 // start swipe
                 /*
                 E: 0.000001 0003 0039 8661	# EV_ABS / ABS_MT_TRACKING_ID   8661
@@ -263,11 +296,14 @@ fn simulate_trackpad(source: &mut Device, sink: &UInputDevice, config: Config) -
                 E: 0.000001 0003 0001 0665	# EV_ABS / ABS_Y                665
                 E: 0.000001 0004 0005 0000	# EV_MSC / MSC_TIMESTAMP        0
                 E: 0.000001 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +0ms
-                 */
+                */
 
-                source
-                    .grab(GrabMode::Grab)
-                    .with_context(|| "failed to grab source device")?;
+                if grab {
+                    if source.grab(GrabMode::Grab).is_err() {
+                        warn!("Failed to grab source device, will not start swiping for now");
+                        continue;
+                    }
+                }
 
                 for finger in 0..fingers {
                     emit(&sink, ABS_MT_SLOT, finger)?;
@@ -280,13 +316,12 @@ fn simulate_trackpad(source: &mut Device, sink: &UInputDevice, config: Config) -
                 emit(&sink, btn_tool, 1)?;
                 sync(&sink)?;
 
-                info!("Started swiping");
+                debug!("Started swiping");
                 state = State::Swiping { x: 0, y: 0 };
             }
             (State::Normal, _, _) => {}
 
-            // TODO configurable
-            (State::Swiping { .. }, EventCode::EV_KEY(EV_KEY::BTN_FORWARD), 0) => {
+            (State::Swiping { .. }, EventCode::EV_KEY(key), 0) if key == trigger_key => {
                 // stop swipe
                 /*
                 E: 2.992985 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
@@ -304,7 +339,7 @@ fn simulate_trackpad(source: &mut Device, sink: &UInputDevice, config: Config) -
                 E: 3.007174 0001 0145 0000	# EV_KEY / BTN_TOOL_FINGER      0
                 E: 3.007174 0004 0005 2948400	# EV_MSC / MSC_TIMESTAMP        2948400
                 E: 3.007174 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
-                 */
+                */
 
                 for finger in 0..fingers {
                     emit(&sink, ABS_MT_SLOT, finger)?;
@@ -314,11 +349,13 @@ fn simulate_trackpad(source: &mut Device, sink: &UInputDevice, config: Config) -
                 emit(&sink, btn_tool, 0)?;
                 sync(&sink)?;
 
-                source
-                    .grab(GrabMode::Ungrab)
-                    .with_context(|| "failed to ungrab source device")?;
+                if grab {
+                    if source.grab(GrabMode::Ungrab).is_err() {
+                        warn!("Failed to ungrab source device, will stop swiping as a failsafe");
+                    }
+                }
 
-                info!("Stopped swiping");
+                debug!("Stopped swiping");
                 state = State::Normal;
             }
             (State::Swiping { mut x, y }, EventCode::EV_REL(REL_X), dx) => {

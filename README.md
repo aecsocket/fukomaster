@@ -48,7 +48,7 @@ This tool must be run as `sudo`, since it needs to read raw mouse inputs from yo
 
 This tool uses `evdev`'s grab functionality, which allows a process to temporarily lock a device's
 inputs so that only that process can consume them, and other processes do not read the events.
-**This may cause some issues!**
+**This may cause some issues with other processes which also grab!**
 
 ### Packages
 
