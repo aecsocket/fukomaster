@@ -37,19 +37,38 @@ pub fn enable_key(dev: &UninitDevice, event: EV_KEY) -> Result<(), io::Error> {
     dev.enable(EventCode::EV_KEY(event))
 }
 
-pub fn enable_abs(
-    dev: &UninitDevice,
-    event: EV_ABS,
-    maximum: i32,
-    resolution: i32,
-) -> Result<(), io::Error> {
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Abs {
+    pub min: i32,
+    pub max: i32,
+    pub resolution: i32,
+}
+
+impl Abs {
+    pub fn new(min: i32, max: i32, resolution: i32) -> Self {
+        Self {
+            min,
+            max,
+            resolution,
+        }
+    }
+
+    pub fn with_max(max: i32) -> Self {
+        Self {
+            max,
+            ..Default::default()
+        }
+    }
+}
+
+pub fn enable_abs(dev: &UninitDevice, event: EV_ABS, abs: Abs) -> Result<(), io::Error> {
     let data = AbsInfo {
         value: 0,
-        minimum: 0,
-        maximum,
+        minimum: abs.min,
+        maximum: abs.max,
         fuzz: 0,
         flat: 0,
-        resolution,
+        resolution: abs.resolution,
     };
     dev.enable_event_code(
         &EventCode::EV_ABS(event),

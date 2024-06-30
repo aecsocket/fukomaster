@@ -2,7 +2,7 @@
 
 mod util;
 
-use std::{fs::File, io, path::PathBuf, thread, time::Duration};
+use std::{fs::File, io, path::PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -14,27 +14,40 @@ use evdev_rs::{
         EV_REL::*,
         EV_SYN::*,
     },
-    Device, DeviceWrapper, ReadFlag, UInputDevice, UninitDevice,
+    Device, DeviceWrapper, GrabMode, ReadFlag, UInputDevice, UninitDevice,
 };
 
-use util::{emit, enable_abs, enable_key, sync};
+use log::info;
+use util::{emit, enable_abs, enable_key, sync, Abs};
 
-/// Simulate a trackpad with your physical mouse.
+/// Simulate a trackpad with your physical mouse
 #[derive(Debug, Clone, clap::Parser)]
 struct Args {
-    /// Source device file to read mouse inputs from (e.g. `/dev/input/event1`).
+    /// Source device file to read mouse inputs from (e.g. `/dev/input/event1`)
     #[arg(short, long)]
     source: PathBuf,
-    /// Number of fingers to simulate a swipe with.
+    /// Number of fingers to simulate a swipe with
     #[arg(short, long, default_value_t = 3)]
-    fingers: usize,
+    fingers: u8,
+    /// Resolution of the virtual trackpad
+    ///
+    /// A larger resolution means you have to move your mouse further to have
+    /// the trackpad move the same distance.
+    ///
+    /// The value is used directly as the resolution of the virtual `uinput`
+    /// device.
+    #[arg(short, long, default_value_t = 12)]
+    resolution: u16,
 }
 
-/// Width and height of the simulated trackpad.
-const SIZE: i32 = u16::MAX as i32;
-
 fn main() -> Result<()> {
-    let Args { source, fingers } = Args::parse();
+    init_logging();
+
+    let Args {
+        source,
+        fingers,
+        resolution,
+    } = Args::parse();
 
     let (fingers, btn_tool): (i32, _) = match fingers {
         2 => (2, BTN_TOOL_DOUBLETAP),
@@ -46,115 +59,27 @@ fn main() -> Result<()> {
         }
     };
 
-    let source = open_device(source).with_context(|| "failed to open source device")?;
-    let sink = create_virtual_trackpad().with_context(|| "failed to create virtual trackpad")?;
+    info!("Starting virtual trackpad sourced from {source:?}");
 
-    eprintln!("Starting");
-    thread::sleep(Duration::from_secs(3));
-    eprintln!("Started");
+    let mut source = open_device(source).with_context(|| "failed to open source device")?;
+    let sink =
+        create_virtual_trackpad(resolution).with_context(|| "failed to create virtual trackpad")?;
+    info!(
+        "Created virtual trackpad (devnode = {:?}, syspath = {:?})",
+        sink.devnode(),
+        sink.syspath()
+    );
 
-    let mut x = SIZE / 2;
-    let mut y = SIZE / 2;
-
-    // start swipe
-    /*
-    E: 0.000001 0003 0039 8661	# EV_ABS / ABS_MT_TRACKING_ID   8661
-    E: 0.000001 0003 0035 0690	# EV_ABS / ABS_MT_POSITION_X    690
-    E: 0.000001 0003 0036 0665	# EV_ABS / ABS_MT_POSITION_Y    665
-    E: 0.000001 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
-    E: 0.000001 0003 0039 8662	# EV_ABS / ABS_MT_TRACKING_ID   8662
-    E: 0.000001 0003 0035 0881	# EV_ABS / ABS_MT_POSITION_X    881
-    E: 0.000001 0003 0036 0306	# EV_ABS / ABS_MT_POSITION_Y    306
-    E: 0.000001 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
-    E: 0.000001 0003 0039 8663	# EV_ABS / ABS_MT_TRACKING_ID   8663
-    E: 0.000001 0003 0035 0679	# EV_ABS / ABS_MT_POSITION_X    679
-    E: 0.000001 0003 0036 0443	# EV_ABS / ABS_MT_POSITION_Y    443
-    E: 0.000001 0001 014a 0001	# EV_KEY / BTN_TOUCH            1
-    E: 0.000001 0001 014e 0001	# EV_KEY / BTN_TOOL_TRIPLETAP   1
-    E: 0.000001 0003 0000 0690	# EV_ABS / ABS_X                690
-    E: 0.000001 0003 0001 0665	# EV_ABS / ABS_Y                665
-    E: 0.000001 0004 0005 0000	# EV_MSC / MSC_TIMESTAMP        0
-    E: 0.000001 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +0ms
-     */
-
-    for finger in 0..fingers {
-        emit(&sink, ABS_MT_SLOT, finger)?;
-        emit(&sink, ABS_MT_TRACKING_ID, finger)?;
-        emit(&sink, ABS_MT_POSITION_X, x)?;
-        emit(&sink, ABS_MT_POSITION_Y, y)?;
-    }
-    emit(&sink, BTN_TOUCH, 1)?;
-    emit(&sink, btn_tool, 1)?;
-    sync(&sink)?;
-
-    loop {
-        let (_status, input) = source
-            .next_event(ReadFlag::NORMAL | ReadFlag::BLOCKING)
-            .with_context(|| "failed to read next event from source device")?;
-
-        let do_write = match input.event_code {
-            EventCode::EV_REL(REL_X) => {
-                x += input.value;
-                true
-            }
-            EventCode::EV_REL(REL_Y) => {
-                y += input.value;
-                true
-            }
-            EventCode::EV_KEY(EV_KEY::BTN_0) => break, // TODO
-            _ => false,
-        };
-        if !do_write {
-            continue;
-        }
-
-        /*
-        E: 0.020080 0003 002f 0000	# EV_ABS / ABS_MT_SLOT          0
-        E: 0.020080 0003 0035 0686	# EV_ABS / ABS_MT_POSITION_X    686
-        E: 0.020080 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
-        E: 0.020080 0003 0035 0878	# EV_ABS / ABS_MT_POSITION_X    878
-        E: 0.020080 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
-        E: 0.020080 0003 0035 0675	# EV_ABS / ABS_MT_POSITION_X    675
-        E: 0.020080 0003 0036 0442	# EV_ABS / ABS_MT_POSITION_Y    442
-        E: 0.020080 0003 0000 0686	# EV_ABS / ABS_X                686
-        E: 0.020080 0004 0005 21000	# EV_MSC / MSC_TIMESTAMP        21000
-        E: 0.020080 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
-        */
-        for finger in 0..fingers {
-            emit(&sink, ABS_MT_SLOT, finger)?;
-            emit(&sink, ABS_MT_POSITION_X, x)?;
-            emit(&sink, ABS_MT_POSITION_Y, y)?;
-        }
-        sync(&sink)?;
-    }
-
-    // stop swipe
-    /*
-    E: 2.992985 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
-    E: 3.000143 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
-    E: 3.000143 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
-    E: 3.000143 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
-    E: 3.000143 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
-    E: 3.000143 0001 0145 0001	# EV_KEY / BTN_TOOL_FINGER      1
-    E: 3.000143 0001 014e 0000	# EV_KEY / BTN_TOOL_TRIPLETAP   0
-    E: 3.000143 0004 0005 2942200	# EV_MSC / MSC_TIMESTAMP        2942200
-    E: 3.000143 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +8ms
-    E: 3.007174 0003 002f 0000	# EV_ABS / ABS_MT_SLOT          0
-    E: 3.007174 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
-    E: 3.007174 0001 014a 0000	# EV_KEY / BTN_TOUCH            0
-    E: 3.007174 0001 0145 0000	# EV_KEY / BTN_TOOL_FINGER      0
-    E: 3.007174 0004 0005 2948400	# EV_MSC / MSC_TIMESTAMP        2948400
-    E: 3.007174 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
-     */
-    for finger in 0..fingers {
-        emit(&sink, ABS_MT_SLOT, finger)?;
-        emit(&sink, ABS_MT_TRACKING_ID, -1)?;
-    }
-    emit(&sink, BTN_TOOL_FINGER, 0)?;
-    emit(&sink, btn_tool, 0)?;
-    sync(&sink)?;
+    simulate_trackpad(&mut source, &sink, Config { fingers, btn_tool })?;
 
     Ok(())
+}
+
+fn init_logging() {
+    let mut builder = pretty_env_logger::formatted_timed_builder();
+    builder.filter_level(log::LevelFilter::Info);
+    builder.parse_default_env();
+    builder.init();
 }
 
 fn open_device(path: PathBuf) -> Result<Device> {
@@ -163,7 +88,7 @@ fn open_device(path: PathBuf) -> Result<Device> {
     Device::new_from_file(file).with_context(|| "failed to create device from file")
 }
 
-fn create_virtual_trackpad() -> Result<UInputDevice> {
+fn create_virtual_trackpad(resolution: u16) -> Result<UInputDevice> {
     /*
     # Supported events:
     #   Event type 0 (EV_SYN)
@@ -249,7 +174,7 @@ fn create_virtual_trackpad() -> Result<UInputDevice> {
     #   Property  type 2 (INPUT_PROP_BUTTONPAD)
      */
 
-    let dev = UninitDevice::new().ok_or(anyhow!("failed to create uninit device"))?;
+    let dev = UninitDevice::new().ok_or(anyhow!("failed to create virtual device"))?;
     dev.set_name("fukomaster virtual trackpad");
     dev.set_bustype(BusType::BUS_VIRTUAL as u16);
 
@@ -271,10 +196,20 @@ fn create_virtual_trackpad() -> Result<UInputDevice> {
         enable_key(&dev, BTN_TOOL_QUADTAP)?;
         enable_key(&dev, BTN_TOOL_QUINTTAP)?;
 
-        enable_abs(&dev, ABS_MT_SLOT, 4, 0)?; // max 5 touches
-        enable_abs(&dev, ABS_MT_TRACKING_ID, 65535, 0)?;
-        enable_abs(&dev, ABS_MT_POSITION_X, SIZE, 1)?;
-        enable_abs(&dev, ABS_MT_POSITION_Y, SIZE, 1)?;
+        enable_abs(&dev, ABS_MT_SLOT, Abs::with_max(4))?; // max 5 touches
+        enable_abs(&dev, ABS_MT_TRACKING_ID, Abs::with_max(i32::MAX))?;
+
+        let resolution = i32::from(resolution);
+        enable_abs(
+            &dev,
+            ABS_MT_POSITION_X,
+            Abs::new(i32::MIN, i32::MAX, resolution),
+        )?;
+        enable_abs(
+            &dev,
+            ABS_MT_POSITION_Y,
+            Abs::new(i32::MIN, i32::MAX, resolution),
+        )?;
 
         Ok::<(), io::Error>(())
     })()
@@ -283,4 +218,141 @@ fn create_virtual_trackpad() -> Result<UInputDevice> {
     let dev = UInputDevice::create_from_device(&dev)
         .with_context(|| "failed to create initialized device")?;
     Ok(dev)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Config {
+    fingers: i32,
+    btn_tool: EV_KEY,
+}
+
+fn simulate_trackpad(source: &mut Device, sink: &UInputDevice, config: Config) -> Result<()> {
+    enum State {
+        Normal,
+        Swiping { x: i32, y: i32 },
+    }
+
+    let Config { fingers, btn_tool } = config;
+    let mut state = State::Normal;
+
+    loop {
+        let (_, input) = source
+            .next_event(ReadFlag::NORMAL | ReadFlag::BLOCKING)
+            .with_context(|| "failed to read next event from source device")?;
+
+        match (&mut state, input.event_code, input.value) {
+            // BTN_FORWARD on MX Master 3S
+            // TODO configurable
+            (State::Normal, EventCode::EV_KEY(EV_KEY::BTN_FORWARD), 1) => {
+                // start swipe
+                /*
+                E: 0.000001 0003 0039 8661	# EV_ABS / ABS_MT_TRACKING_ID   8661
+                E: 0.000001 0003 0035 0690	# EV_ABS / ABS_MT_POSITION_X    690
+                E: 0.000001 0003 0036 0665	# EV_ABS / ABS_MT_POSITION_Y    665
+                E: 0.000001 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
+                E: 0.000001 0003 0039 8662	# EV_ABS / ABS_MT_TRACKING_ID   8662
+                E: 0.000001 0003 0035 0881	# EV_ABS / ABS_MT_POSITION_X    881
+                E: 0.000001 0003 0036 0306	# EV_ABS / ABS_MT_POSITION_Y    306
+                E: 0.000001 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
+                E: 0.000001 0003 0039 8663	# EV_ABS / ABS_MT_TRACKING_ID   8663
+                E: 0.000001 0003 0035 0679	# EV_ABS / ABS_MT_POSITION_X    679
+                E: 0.000001 0003 0036 0443	# EV_ABS / ABS_MT_POSITION_Y    443
+                E: 0.000001 0001 014a 0001	# EV_KEY / BTN_TOUCH            1
+                E: 0.000001 0001 014e 0001	# EV_KEY / BTN_TOOL_TRIPLETAP   1
+                E: 0.000001 0003 0000 0690	# EV_ABS / ABS_X                690
+                E: 0.000001 0003 0001 0665	# EV_ABS / ABS_Y                665
+                E: 0.000001 0004 0005 0000	# EV_MSC / MSC_TIMESTAMP        0
+                E: 0.000001 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +0ms
+                 */
+
+                source
+                    .grab(GrabMode::Grab)
+                    .with_context(|| "failed to grab source device")?;
+
+                for finger in 0..fingers {
+                    emit(&sink, ABS_MT_SLOT, finger)?;
+                    emit(&sink, ABS_MT_TRACKING_ID, finger)?;
+                    // (0, 0) is the center of the virtual trackpad
+                    emit(&sink, ABS_MT_POSITION_X, 0)?;
+                    emit(&sink, ABS_MT_POSITION_Y, 0)?;
+                }
+                emit(&sink, BTN_TOUCH, 1)?;
+                emit(&sink, btn_tool, 1)?;
+                sync(&sink)?;
+
+                info!("Started swiping");
+                state = State::Swiping { x: 0, y: 0 };
+            }
+            (State::Normal, _, _) => {}
+
+            // TODO configurable
+            (State::Swiping { .. }, EventCode::EV_KEY(EV_KEY::BTN_FORWARD), 0) => {
+                // stop swipe
+                /*
+                E: 2.992985 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
+                E: 3.000143 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
+                E: 3.000143 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
+                E: 3.000143 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
+                E: 3.000143 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
+                E: 3.000143 0001 0145 0001	# EV_KEY / BTN_TOOL_FINGER      1
+                E: 3.000143 0001 014e 0000	# EV_KEY / BTN_TOOL_TRIPLETAP   0
+                E: 3.000143 0004 0005 2942200	# EV_MSC / MSC_TIMESTAMP        2942200
+                E: 3.000143 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +8ms
+                E: 3.007174 0003 002f 0000	# EV_ABS / ABS_MT_SLOT          0
+                E: 3.007174 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
+                E: 3.007174 0001 014a 0000	# EV_KEY / BTN_TOUCH            0
+                E: 3.007174 0001 0145 0000	# EV_KEY / BTN_TOOL_FINGER      0
+                E: 3.007174 0004 0005 2948400	# EV_MSC / MSC_TIMESTAMP        2948400
+                E: 3.007174 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
+                 */
+
+                for finger in 0..fingers {
+                    emit(&sink, ABS_MT_SLOT, finger)?;
+                    emit(&sink, ABS_MT_TRACKING_ID, -1)?;
+                }
+                emit(&sink, BTN_TOOL_FINGER, 0)?;
+                emit(&sink, btn_tool, 0)?;
+                sync(&sink)?;
+
+                source
+                    .grab(GrabMode::Ungrab)
+                    .with_context(|| "failed to ungrab source device")?;
+
+                info!("Stopped swiping");
+                state = State::Normal;
+            }
+            (State::Swiping { mut x, y }, EventCode::EV_REL(REL_X), dx) => {
+                x += dx;
+                update_position(sink, fingers, x, *y)?;
+            }
+            (State::Swiping { x, mut y }, EventCode::EV_REL(REL_Y), dy) => {
+                y += dy;
+                update_position(sink, fingers, *x, y)?;
+            }
+            (State::Swiping { .. }, _, _) => {}
+        }
+    }
+}
+
+fn update_position(sink: &UInputDevice, fingers: i32, x: i32, y: i32) -> Result<()> {
+    /*
+    E: 0.020080 0003 002f 0000	# EV_ABS / ABS_MT_SLOT          0
+    E: 0.020080 0003 0035 0686	# EV_ABS / ABS_MT_POSITION_X    686
+    E: 0.020080 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
+    E: 0.020080 0003 0035 0878	# EV_ABS / ABS_MT_POSITION_X    878
+    E: 0.020080 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
+    E: 0.020080 0003 0035 0675	# EV_ABS / ABS_MT_POSITION_X    675
+    E: 0.020080 0003 0036 0442	# EV_ABS / ABS_MT_POSITION_Y    442
+    E: 0.020080 0003 0000 0686	# EV_ABS / ABS_X                686
+    E: 0.020080 0004 0005 21000	# EV_MSC / MSC_TIMESTAMP        21000
+    E: 0.020080 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
+    */
+    for finger in 0..fingers {
+        emit(&sink, ABS_MT_SLOT, finger)?;
+        emit(&sink, ABS_MT_POSITION_X, x)?;
+        emit(&sink, ABS_MT_POSITION_Y, y)?;
+    }
+    sync(&sink)?;
+
+    Ok(())
 }

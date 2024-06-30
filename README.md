@@ -29,9 +29,6 @@ kinds of things, such as swiping right to go back in a web browser. You are, how
 fact that all of your virtual fingers will be moving in the same direction at the same speed, so you
 can't, for example, simulate a pinch-and-zoom.
 
-[MX Master 3S]: https://www.logitech.com/en-eu/products/mice/mx-master-3s.910-006559.html
-[Solaar]: https://pwr-solaar.github.io/Solaar/
-
 ## Demo
 
 TODO videos
@@ -43,6 +40,15 @@ Tested on:
   - [x] GNOME 46
 - [ ] Xorg
   - TODO
+
+This tool must be run as `sudo`, since it needs to read raw mouse inputs from your physical mouse.
+
+**If using [Solaar],** the *Key/Button Diversion* for the *Mouse Gesture Button* must be set to
+*Regular*, so that this tool can read the mouse gesture button being pressed/released.
+
+This tool uses `evdev`'s grab functionality, which allows a process to temporarily lock a device's
+inputs so that only that process can consume them, and other processes do not read the events.
+**This may cause some issues!**
 
 ### Packages
 
@@ -58,3 +64,6 @@ cargo run
 
 - `master`: because I wrote it for my MX Master 3S
 - `fuko`: ヒトデです！
+
+[MX Master 3S]: https://www.logitech.com/en-eu/products/mice/mx-master-3s.910-006559.html
+[Solaar]: https://pwr-solaar.github.io/Solaar/
