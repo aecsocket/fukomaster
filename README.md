@@ -4,7 +4,7 @@ Simulate a trackpad with your physical mouse.
 
 <center>
 
-https://github.com/aecsocket/fukomaster/assets/43144841/e3c5d35a-5a9b-4712-bc81-c43085fff9a8
+<https://github.com/aecsocket/fukomaster/assets/43144841/e3c5d35a-5a9b-4712-bc81-c43085fff9a8>
 
 *Using fukomaster with an MX Master 3S on GNOME with the
 [PaperWM](https://github.com/paperwm/PaperWM) tiling WM extension*
