@@ -1,137 +1,35 @@
 #![doc = include_str!("../README.md")]
 
-use std::{
-    io, thread,
-    time::{Duration, SystemTime},
-};
+mod util;
+
+use std::{thread, time::Duration};
 
 use anyhow::{anyhow, Result};
+use clap::Parser;
 use evdev_rs::{
-    enums::{
-        BusType, EventCode, InputProp,
-        EV_ABS::{self, *},
-        EV_KEY::{self, *},
-        EV_REL::{self, *},
-        EV_SYN::{self, *},
-    },
-    AbsInfo, DeviceWrapper, EnableCodeData, InputEvent, TimeVal, UInputDevice, UninitDevice,
+    enums::{BusType, EventCode, InputProp, EV_ABS::*, EV_KEY::*, EV_SYN::*},
+    DeviceWrapper, UInputDevice, UninitDevice,
 };
 
-// Copied from my evemu recording of my laptop trackpad
-/*
-# Supported events:
-#   Event type 0 (EV_SYN)
-#     Event code 0 (SYN_REPORT)
-#     Event code 1 (SYN_CONFIG)
-#     Event code 2 (SYN_MT_REPORT)
-#     Event code 3 (SYN_DROPPED)
-#     Event code 4 ((null))
-#     Event code 5 ((null))
-#     Event code 6 ((null))
-#     Event code 7 ((null))
-#     Event code 8 ((null))
-#     Event code 9 ((null))
-#     Event code 10 ((null))
-#     Event code 11 ((null))
-#     Event code 12 ((null))
-#     Event code 13 ((null))
-#     Event code 14 ((null))
-#     Event code 15 (SYN_MAX)
-#   Event type 1 (EV_KEY)
-#     Event code 272 (BTN_LEFT)
-#     Event code 273 (BTN_RIGHT)
-#     Event code 325 (BTN_TOOL_FINGER)
-#     Event code 328 (BTN_TOOL_QUINTTAP)
-#     Event code 330 (BTN_TOUCH)
-#     Event code 333 (BTN_TOOL_DOUBLETAP)
-#     Event code 334 (BTN_TOOL_TRIPLETAP)
-#     Event code 335 (BTN_TOOL_QUADTAP)
-#   Event type 3 (EV_ABS)
-#     Event code 0 (ABS_X)
-#       Value      848
-#       Min          0
-#       Max       1337
-#       Fuzz         0
-#       Flat         0
-#       Resolution  12
-#     Event code 1 (ABS_Y)
-#       Value      467
-#       Min          0
-#       Max        876
-#       Fuzz         0
-#       Flat         0
-#       Resolution  12
-#     Event code 47 (ABS_MT_SLOT)
-#       Value        0
-#       Min          0
-#       Max          4
-#       Fuzz         0
-#       Flat         0
-#       Resolution   0
-#     Event code 53 (ABS_MT_POSITION_X)
-#       Value        0
-#       Min          0
-#       Max       1337
-#       Fuzz         0
-#       Flat         0
-#       Resolution  12
-#     Event code 54 (ABS_MT_POSITION_Y)
-#       Value        0
-#       Min          0
-#       Max        876
-#       Fuzz         0
-#       Flat         0
-#       Resolution  12
-#     Event code 55 (ABS_MT_TOOL_TYPE)
-#       Value        0
-#       Min          0
-#       Max          2
-#       Fuzz         0
-#       Flat         0
-#       Resolution   0
-#     Event code 57 (ABS_MT_TRACKING_ID)
-#       Value        0
-#       Min          0
-#       Max      65535
-#       Fuzz         0
-#       Flat         0
-#       Resolution   0
-#   Event type 4 (EV_MSC)
-#     Event code 5 (MSC_TIMESTAMP)
-# Properties:
-#   Property  type 0 (INPUT_PROP_POINTER)
-#   Property  type 2 (INPUT_PROP_BUTTONPAD)
- */
+use util::{emit, enable_abs, enable_key, sync};
+
+/// Simulate a trackpad with your physical mouse.
+#[derive(Debug, Clone, clap::Parser)]
+struct Args {
+    /// Number of fingers to simulate a swipe with.
+    #[arg(short, long, default_value_t = 3)]
+    fingers: usize,
+}
 
 fn main() -> Result<()> {
-    let dev = UninitDevice::new().ok_or(anyhow!("failed to create uninit device"))?;
-    dev.set_name("fukomaster virtual trackpad");
-    dev.set_bustype(BusType::BUS_USB as u16);
+    let Args { fingers } = Args::parse();
 
-    // randomly generated IDs
-    dev.set_vendor_id(0x4394);
-    dev.set_product_id(0xd1fc);
+    if !(2..=5).contains(&fingers) {
+        return Err(anyhow!("can only swipe with 2, 3, 4 or 5 fingers"));
+    }
+    let fingers = i32::try_from(fingers).unwrap();
 
-    // https://www.kernel.org/doc/html/v4.12/input/event-codes.html
-    // https://www.kernel.org/doc/html/v4.12/input/multi-touch-protocol.html
-
-    dev.enable(InputProp::INPUT_PROP_POINTER)?;
-    dev.enable(EventCode::EV_SYN(SYN_REPORT))?;
-
-    enable_key(&dev, BTN_TOOL_FINGER)?;
-    enable_key(&dev, BTN_TOUCH)?;
-    enable_key(&dev, BTN_TOOL_DOUBLETAP)?;
-    enable_key(&dev, BTN_TOOL_TRIPLETAP)?;
-    enable_key(&dev, BTN_TOOL_QUADTAP)?;
-    enable_key(&dev, BTN_TOOL_QUINTTAP)?;
-
-    enable_abs(&dev, ABS_MT_SLOT, 4, 0)?; // max 5 touches
-    enable_abs(&dev, ABS_MT_TRACKING_ID, 65535, 0)?;
-    enable_abs(&dev, ABS_MT_TOOL_TYPE, 2, 0)?;
-    enable_abs(&dev, ABS_MT_POSITION_X, 10000, 12)?;
-    enable_abs(&dev, ABS_MT_POSITION_Y, 10000, 12)?;
-
-    let dev = UInputDevice::create_from_device(&dev)?;
+    let dev = create_virtual_trackpad()?;
 
     eprintln!("Starting");
     thread::sleep(Duration::from_secs(3));
@@ -159,24 +57,15 @@ fn main() -> Result<()> {
      */
 
     let start_x = 5000;
-    emit(&dev, ABS_MT_TRACKING_ID, 8661)?;
-    emit(&dev, ABS_MT_POSITION_X, start_x)?;
-    emit(&dev, ABS_MT_POSITION_Y, 5000)?;
 
-    emit(&dev, ABS_MT_SLOT, 1)?;
-    emit(&dev, ABS_MT_TRACKING_ID, 8662)?;
-    emit(&dev, ABS_MT_POSITION_X, start_x)?;
-    emit(&dev, ABS_MT_POSITION_Y, 6000)?;
-
-    emit(&dev, ABS_MT_SLOT, 2)?;
-    emit(&dev, ABS_MT_TRACKING_ID, 8663)?;
-    emit(&dev, ABS_MT_POSITION_X, start_x)?;
-    emit(&dev, ABS_MT_POSITION_Y, 7000)?;
-
+    for finger in 0..fingers {
+        emit(&dev, ABS_MT_SLOT, finger)?;
+        emit(&dev, ABS_MT_TRACKING_ID, finger)?;
+        emit(&dev, ABS_MT_POSITION_X, start_x)?;
+        emit(&dev, ABS_MT_POSITION_Y, 5000)?;
+    }
     emit(&dev, BTN_TOUCH, 1)?;
     emit(&dev, BTN_TOOL_TRIPLETAP, 1)?;
-    // ABS_X, ABS_Y
-
     sync(&dev)?;
 
     for i in 0..100 {
@@ -195,13 +84,10 @@ fn main() -> Result<()> {
 
         let x = start_x + i * 2;
 
-        emit(&dev, ABS_MT_SLOT, 0)?;
-        emit(&dev, ABS_MT_POSITION_X, x)?;
-        emit(&dev, ABS_MT_SLOT, 1)?;
-        emit(&dev, ABS_MT_POSITION_X, x)?;
-        emit(&dev, ABS_MT_SLOT, 2)?;
-        emit(&dev, ABS_MT_POSITION_X, x)?;
-        // ABS_X
+        for finger in 0..fingers {
+            emit(&dev, ABS_MT_SLOT, finger)?;
+            emit(&dev, ABS_MT_POSITION_X, x)?;
+        }
         sync(&dev)?;
 
         thread::sleep(Duration::from_millis(10));
@@ -225,85 +111,131 @@ fn main() -> Result<()> {
     E: 3.007174 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
      */
 
-    emit(&dev, ABS_MT_SLOT, 1)?;
-    emit(&dev, ABS_MT_TRACKING_ID, -1)?;
-    emit(&dev, ABS_MT_SLOT, 2)?;
-    emit(&dev, ABS_MT_TRACKING_ID, -1)?;
-    emit(&dev, BTN_TOOL_FINGER, 1)?;
+    for finger in 0..fingers {
+        emit(&dev, ABS_MT_SLOT, finger)?;
+        emit(&dev, ABS_MT_TRACKING_ID, -1)?;
+    }
+    emit(&dev, BTN_TOOL_FINGER, 0)?;
     emit(&dev, BTN_TOOL_TRIPLETAP, 0)?;
     sync(&dev)?;
 
-    emit(&dev, ABS_MT_SLOT, 0)?;
-    emit(&dev, ABS_MT_TRACKING_ID, -1)?;
-    emit(&dev, BTN_TOUCH, 0)?;
-    emit(&dev, BTN_TOOL_FINGER, 0)?;
-    sync(&dev)?;
-
     Ok(())
 }
 
-trait IntoEventCode {
-    fn into_event_code(self) -> EventCode;
-}
+fn create_virtual_trackpad() -> Result<UInputDevice> {
+    // Copied from my evemu recording of my laptop trackpad
+    /*
+    # Supported events:
+    #   Event type 0 (EV_SYN)
+    #     Event code 0 (SYN_REPORT)
+    #     Event code 1 (SYN_CONFIG)
+    #     Event code 2 (SYN_MT_REPORT)
+    #     Event code 3 (SYN_DROPPED)
+    #     Event code 4 ((null))
+    #     Event code 5 ((null))
+    #     Event code 6 ((null))
+    #     Event code 7 ((null))
+    #     Event code 8 ((null))
+    #     Event code 9 ((null))
+    #     Event code 10 ((null))
+    #     Event code 11 ((null))
+    #     Event code 12 ((null))
+    #     Event code 13 ((null))
+    #     Event code 14 ((null))
+    #     Event code 15 (SYN_MAX)
+    #   Event type 1 (EV_KEY)
+    #     Event code 272 (BTN_LEFT)
+    #     Event code 273 (BTN_RIGHT)
+    #     Event code 325 (BTN_TOOL_FINGER)
+    #     Event code 328 (BTN_TOOL_QUINTTAP)
+    #     Event code 330 (BTN_TOUCH)
+    #     Event code 333 (BTN_TOOL_DOUBLETAP)
+    #     Event code 334 (BTN_TOOL_TRIPLETAP)
+    #     Event code 335 (BTN_TOOL_QUADTAP)
+    #   Event type 3 (EV_ABS)
+    #     Event code 0 (ABS_X)
+    #       Value      848
+    #       Min          0
+    #       Max       1337
+    #       Fuzz         0
+    #       Flat         0
+    #       Resolution  12
+    #     Event code 1 (ABS_Y)
+    #       Value      467
+    #       Min          0
+    #       Max        876
+    #       Fuzz         0
+    #       Flat         0
+    #       Resolution  12
+    #     Event code 47 (ABS_MT_SLOT)
+    #       Value        0
+    #       Min          0
+    #       Max          4
+    #       Fuzz         0
+    #       Flat         0
+    #       Resolution   0
+    #     Event code 53 (ABS_MT_POSITION_X)
+    #       Value        0
+    #       Min          0
+    #       Max       1337
+    #       Fuzz         0
+    #       Flat         0
+    #       Resolution  12
+    #     Event code 54 (ABS_MT_POSITION_Y)
+    #       Value        0
+    #       Min          0
+    #       Max        876
+    #       Fuzz         0
+    #       Flat         0
+    #       Resolution  12
+    #     Event code 55 (ABS_MT_TOOL_TYPE)
+    #       Value        0
+    #       Min          0
+    #       Max          2
+    #       Fuzz         0
+    #       Flat         0
+    #       Resolution   0
+    #     Event code 57 (ABS_MT_TRACKING_ID)
+    #       Value        0
+    #       Min          0
+    #       Max      65535
+    #       Fuzz         0
+    #       Flat         0
+    #       Resolution   0
+    #   Event type 4 (EV_MSC)
+    #     Event code 5 (MSC_TIMESTAMP)
+    # Properties:
+    #   Property  type 0 (INPUT_PROP_POINTER)
+    #   Property  type 2 (INPUT_PROP_BUTTONPAD)
+     */
 
-impl IntoEventCode for EventCode {
-    fn into_event_code(self) -> EventCode {
-        self
-    }
-}
+    let dev = UninitDevice::new().ok_or(anyhow!("failed to create uninit device"))?;
+    dev.set_name("fukomaster virtual trackpad");
+    dev.set_bustype(BusType::BUS_USB as u16); // optional
 
-impl IntoEventCode for EV_KEY {
-    fn into_event_code(self) -> EventCode {
-        EventCode::EV_KEY(self)
-    }
-}
+    // randomly generated IDs
+    dev.set_vendor_id(0x4394);
+    dev.set_product_id(0xd1fc);
 
-impl IntoEventCode for EV_ABS {
-    fn into_event_code(self) -> EventCode {
-        EventCode::EV_ABS(self)
-    }
-}
+    // https://www.kernel.org/doc/html/v4.12/input/event-codes.html
+    // https://www.kernel.org/doc/html/v4.12/input/multi-touch-protocol.html
 
-impl IntoEventCode for EV_SYN {
-    fn into_event_code(self) -> EventCode {
-        EventCode::EV_SYN(self)
-    }
-}
+    dev.enable(InputProp::INPUT_PROP_POINTER)?;
+    dev.enable(EventCode::EV_SYN(SYN_REPORT))?;
 
-fn enable_key(dev: &UninitDevice, event: EV_KEY) -> Result<(), io::Error> {
-    dev.enable(EventCode::EV_KEY(event))
-}
+    enable_key(&dev, BTN_TOOL_FINGER)?;
+    enable_key(&dev, BTN_TOUCH)?;
+    enable_key(&dev, BTN_TOOL_DOUBLETAP)?;
+    enable_key(&dev, BTN_TOOL_TRIPLETAP)?;
+    enable_key(&dev, BTN_TOOL_QUADTAP)?;
+    enable_key(&dev, BTN_TOOL_QUINTTAP)?;
 
-fn enable_abs(
-    dev: &UninitDevice,
-    event: EV_ABS,
-    maximum: i32,
-    resolution: i32,
-) -> Result<(), io::Error> {
-    let data = AbsInfo {
-        value: 0,
-        minimum: 0,
-        maximum,
-        fuzz: 0,
-        flat: 0,
-        resolution,
-    };
-    dev.enable_event_code(
-        &EventCode::EV_ABS(event),
-        Some(EnableCodeData::AbsInfo(data)),
-    )
-}
+    enable_abs(&dev, ABS_MT_SLOT, 4, 0)?; // max 5 touches
+    enable_abs(&dev, ABS_MT_TRACKING_ID, 65535, 0)?;
+    enable_abs(&dev, ABS_MT_TOOL_TYPE, 2, 0)?;
+    enable_abs(&dev, ABS_MT_POSITION_X, 10000, 12)?;
+    enable_abs(&dev, ABS_MT_POSITION_Y, 10000, 12)?;
 
-fn emit(dev: &UInputDevice, event: impl IntoEventCode, value: i32) -> Result<()> {
-    let now = TimeVal::try_from(SystemTime::now())?;
-    dev.write_event(&InputEvent {
-        time: now,
-        event_code: event.into_event_code(),
-        value,
-    })?;
-    Ok(())
-}
-
-fn sync(dev: &UInputDevice) -> Result<()> {
-    emit(dev, EV_SYN::SYN_REPORT, 0)
+    let dev = UInputDevice::create_from_device(&dev)?;
+    Ok(dev)
 }

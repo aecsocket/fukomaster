@@ -1,6 +1,6 @@
 # `fukomaster`
 
-Emulate a trackpad with your physical mouse.
+Simulate a trackpad with your physical mouse.
 
 ## Motivation
 
@@ -20,9 +20,14 @@ three fingers and start swiping left/right, the desktop will swipe **smoothly** 
 that you swipe - that is, it's not an abrupt change like a keybinding, but a gradual process. The
 more you swipe, or the faster you swipe, the further the desktop moves to the next workspace.
 
-fukomaster allows you to emulate this behavior by temporarily turning your mouse into a trackpad;
+fukomaster allows you to simulate this behavior by temporarily turning your mouse into a trackpad;
 starting a three-finger swipe (or however many you have configured); then converting your mouse
 movements into finger movements on the virtual trackpad.
+
+Note that this doesn't just work with switching workspaces - you can use trackpad gestures for all
+kinds of things, such as swiping right to go back in a web browser. You are, however, limited to the
+fact that all of your virtual fingers will be moving in the same direction at the same speed, so you
+can't, for example, simulate a pinch-and-zoom.
 
 [MX Master 3S]: https://www.logitech.com/en-eu/products/mice/mx-master-3s.910-006559.html
 [Solaar]: https://pwr-solaar.github.io/Solaar/
