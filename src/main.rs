@@ -47,6 +47,12 @@ struct Args {
     /// device.
     #[arg(short, long, default_value_t = 12)]
     resolution: u16,
+    /// Swipe speed multiplier on the X axis
+    #[arg(short, long, default_value_t = 1.0)]
+    x_mult: f32,
+    /// Swipe speed multiplier on the Y axis
+    #[arg(short, long, default_value_t = 1.0)]
+    y_mult: f32,
     /// Disables grabbing the mouse cursor in `evdev` when swiping
     ///
     /// If grabbing is disabled, the mouse cursor will move with the virtual
@@ -54,6 +60,9 @@ struct Args {
     /// which also attempt to grab the mouse.
     #[arg(long)]
     no_grab: bool,
+    /// Enter the swiping mode when the process starts
+    #[arg(long)]
+    start_swiping: bool,
 }
 
 fn main() -> Result<()> {
@@ -64,7 +73,10 @@ fn main() -> Result<()> {
         trigger_key,
         fingers,
         resolution,
+        x_mult,
+        y_mult,
         no_grab,
+        start_swiping,
     } = Args::parse();
 
     let trigger_key =
@@ -85,6 +97,9 @@ fn main() -> Result<()> {
     let mut source = open_device(source).with_context(|| "failed to open source device")?;
     let sink =
         create_virtual_trackpad(resolution).with_context(|| "failed to create virtual trackpad")?;
+    // we need a slight delay after creating the input device
+    // so that other components can recognize it
+    std::thread::sleep(std::time::Duration::from_millis(200));
     info!("Created virtual trackpad");
     info!("  devnode = {:?}", sink.devnode());
     info!("  syspath = {:?}", sink.syspath());
@@ -96,7 +111,10 @@ fn main() -> Result<()> {
             fingers,
             trigger_key,
             btn_tool,
+            x_mult,
+            y_mult,
             grab: !no_grab,
+            start_swiping,
         },
     )?;
 
@@ -253,7 +271,10 @@ struct Config {
     fingers: i32,
     trigger_key: EV_KEY,
     btn_tool: EV_KEY,
+    x_mult: f32,
+    y_mult: f32,
     grab: bool,
+    start_swiping: bool,
 }
 
 fn simulate_trackpad(source: &mut Device, sink: &UInputDevice, config: Config) -> Result<()> {
@@ -262,13 +283,29 @@ fn simulate_trackpad(source: &mut Device, sink: &UInputDevice, config: Config) -
         Swiping { x: i32, y: i32 },
     }
 
+    impl State {
+        fn swiping() -> Self {
+            Self::Swiping { x: 0, y: 0 }
+        }
+    }
+
     let Config {
         fingers,
         trigger_key,
         btn_tool,
+        x_mult,
+        y_mult,
         grab,
+        start_swiping,
     } = config;
-    let mut state = State::Normal;
+
+    let mut state = if start_swiping {
+        start_swipe(source, sink, fingers, btn_tool, grab)
+            .with_context(|| "failed to start swipe")?;
+        State::swiping()
+    } else {
+        State::Normal
+    };
 
     loop {
         let (_, input) = source
@@ -277,101 +314,85 @@ fn simulate_trackpad(source: &mut Device, sink: &UInputDevice, config: Config) -
 
         match (&mut state, input.event_code, input.value) {
             (State::Normal, EventCode::EV_KEY(key), 1) if key == trigger_key => {
-                // start swipe
-                /*
-                E: 0.000001 0003 0039 8661	# EV_ABS / ABS_MT_TRACKING_ID   8661
-                E: 0.000001 0003 0035 0690	# EV_ABS / ABS_MT_POSITION_X    690
-                E: 0.000001 0003 0036 0665	# EV_ABS / ABS_MT_POSITION_Y    665
-                E: 0.000001 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
-                E: 0.000001 0003 0039 8662	# EV_ABS / ABS_MT_TRACKING_ID   8662
-                E: 0.000001 0003 0035 0881	# EV_ABS / ABS_MT_POSITION_X    881
-                E: 0.000001 0003 0036 0306	# EV_ABS / ABS_MT_POSITION_Y    306
-                E: 0.000001 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
-                E: 0.000001 0003 0039 8663	# EV_ABS / ABS_MT_TRACKING_ID   8663
-                E: 0.000001 0003 0035 0679	# EV_ABS / ABS_MT_POSITION_X    679
-                E: 0.000001 0003 0036 0443	# EV_ABS / ABS_MT_POSITION_Y    443
-                E: 0.000001 0001 014a 0001	# EV_KEY / BTN_TOUCH            1
-                E: 0.000001 0001 014e 0001	# EV_KEY / BTN_TOOL_TRIPLETAP   1
-                E: 0.000001 0003 0000 0690	# EV_ABS / ABS_X                690
-                E: 0.000001 0003 0001 0665	# EV_ABS / ABS_Y                665
-                E: 0.000001 0004 0005 0000	# EV_MSC / MSC_TIMESTAMP        0
-                E: 0.000001 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +0ms
-                */
-
-                if grab {
-                    if source.grab(GrabMode::Grab).is_err() {
-                        warn!("Failed to grab source device, will not start swiping for now");
-                        continue;
-                    }
-                }
-
-                for finger in 0..fingers {
-                    emit(&sink, ABS_MT_SLOT, finger)?;
-                    emit(&sink, ABS_MT_TRACKING_ID, finger)?;
-                    // (0, 0) is the center of the virtual trackpad
-                    emit(&sink, ABS_MT_POSITION_X, 0)?;
-                    emit(&sink, ABS_MT_POSITION_Y, 0)?;
-                }
-                emit(&sink, BTN_TOUCH, 1)?;
-                emit(&sink, btn_tool, 1)?;
-                sync(&sink)?;
-
-                debug!("Started swiping");
-                state = State::Swiping { x: 0, y: 0 };
+                start_swipe(source, sink, fingers, btn_tool, grab)
+                    .with_context(|| "failed to start swipe")?;
+                state = State::swiping();
             }
-            (State::Normal, _, _) => {}
 
             (State::Swiping { .. }, EventCode::EV_KEY(key), 0) if key == trigger_key => {
-                // stop swipe
-                /*
-                E: 2.992985 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
-                E: 3.000143 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
-                E: 3.000143 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
-                E: 3.000143 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
-                E: 3.000143 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
-                E: 3.000143 0001 0145 0001	# EV_KEY / BTN_TOOL_FINGER      1
-                E: 3.000143 0001 014e 0000	# EV_KEY / BTN_TOOL_TRIPLETAP   0
-                E: 3.000143 0004 0005 2942200	# EV_MSC / MSC_TIMESTAMP        2942200
-                E: 3.000143 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +8ms
-                E: 3.007174 0003 002f 0000	# EV_ABS / ABS_MT_SLOT          0
-                E: 3.007174 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
-                E: 3.007174 0001 014a 0000	# EV_KEY / BTN_TOUCH            0
-                E: 3.007174 0001 0145 0000	# EV_KEY / BTN_TOOL_FINGER      0
-                E: 3.007174 0004 0005 2948400	# EV_MSC / MSC_TIMESTAMP        2948400
-                E: 3.007174 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
-                */
-
-                for finger in 0..fingers {
-                    emit(&sink, ABS_MT_SLOT, finger)?;
-                    emit(&sink, ABS_MT_TRACKING_ID, -1)?;
-                }
-                emit(&sink, BTN_TOOL_FINGER, 0)?;
-                emit(&sink, btn_tool, 0)?;
-                sync(&sink)?;
-
-                if grab {
-                    if source.grab(GrabMode::Ungrab).is_err() {
-                        warn!("Failed to ungrab source device, will stop swiping as a failsafe");
-                    }
-                }
-
-                debug!("Stopped swiping");
+                stop_swipe(source, sink, fingers, btn_tool, grab)
+                    .with_context(|| "failed to stop swipe")?;
                 state = State::Normal;
             }
-            (State::Swiping { mut x, y }, EventCode::EV_REL(REL_X), dx) => {
-                x += dx;
-                update_position(sink, fingers, x, *y)?;
+            (State::Swiping { ref mut x, y }, EventCode::EV_REL(REL_X), dx) => {
+                *x += dx;
+                update_position(sink, fingers, *x, x_mult, *y, y_mult)?;
             }
-            (State::Swiping { x, mut y }, EventCode::EV_REL(REL_Y), dy) => {
-                y += dy;
-                update_position(sink, fingers, *x, y)?;
+            (State::Swiping { x, ref mut y }, EventCode::EV_REL(REL_Y), dy) => {
+                *y += dy;
+                update_position(sink, fingers, *x, x_mult, *y, y_mult)?;
             }
-            (State::Swiping { .. }, _, _) => {}
+
+            (State::Normal | State::Swiping { .. }, _, _) => {}
         }
     }
 }
 
-fn update_position(sink: &UInputDevice, fingers: i32, x: i32, y: i32) -> Result<()> {
+fn start_swipe(
+    source: &mut Device,
+    sink: &UInputDevice,
+    fingers: i32,
+    btn_tool: EV_KEY,
+    grab: bool,
+) -> Result<()> {
+    if grab && source.grab(GrabMode::Grab).is_err() {
+        warn!("Failed to grab source device, will not start swiping for now");
+        return Ok(());
+    }
+
+    /*
+    E: 0.000001 0003 0039 8661	# EV_ABS / ABS_MT_TRACKING_ID   8661
+    E: 0.000001 0003 0035 0690	# EV_ABS / ABS_MT_POSITION_X    690
+    E: 0.000001 0003 0036 0665	# EV_ABS / ABS_MT_POSITION_Y    665
+    E: 0.000001 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
+    E: 0.000001 0003 0039 8662	# EV_ABS / ABS_MT_TRACKING_ID   8662
+    E: 0.000001 0003 0035 0881	# EV_ABS / ABS_MT_POSITION_X    881
+    E: 0.000001 0003 0036 0306	# EV_ABS / ABS_MT_POSITION_Y    306
+    E: 0.000001 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
+    E: 0.000001 0003 0039 8663	# EV_ABS / ABS_MT_TRACKING_ID   8663
+    E: 0.000001 0003 0035 0679	# EV_ABS / ABS_MT_POSITION_X    679
+    E: 0.000001 0003 0036 0443	# EV_ABS / ABS_MT_POSITION_Y    443
+    E: 0.000001 0001 014a 0001	# EV_KEY / BTN_TOUCH            1
+    E: 0.000001 0001 014e 0001	# EV_KEY / BTN_TOOL_TRIPLETAP   1
+    E: 0.000001 0003 0000 0690	# EV_ABS / ABS_X                690
+    E: 0.000001 0003 0001 0665	# EV_ABS / ABS_Y                665
+    E: 0.000001 0004 0005 0000	# EV_MSC / MSC_TIMESTAMP        0
+    E: 0.000001 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +0ms
+    */
+
+    for finger in 0..fingers {
+        emit(sink, ABS_MT_SLOT, finger)?;
+        emit(sink, ABS_MT_TRACKING_ID, finger)?;
+        // (0, 0) is the center of the virtual trackpad
+        emit(sink, ABS_MT_POSITION_X, 0)?;
+        emit(sink, ABS_MT_POSITION_Y, 0)?;
+    }
+    emit(sink, BTN_TOUCH, 1)?;
+    emit(sink, btn_tool, 1)?;
+    sync(sink)?;
+
+    debug!("Started swiping");
+    Ok(())
+}
+
+fn update_position(
+    dev: &UInputDevice,
+    fingers: i32,
+    x: i32,
+    x_mult: f32,
+    y: i32,
+    y_mult: f32,
+) -> Result<()> {
     /*
     E: 0.020080 0003 002f 0000	# EV_ABS / ABS_MT_SLOT          0
     E: 0.020080 0003 0035 0686	# EV_ABS / ABS_MT_POSITION_X    686
@@ -384,12 +405,61 @@ fn update_position(sink: &UInputDevice, fingers: i32, x: i32, y: i32) -> Result<
     E: 0.020080 0004 0005 21000	# EV_MSC / MSC_TIMESTAMP        21000
     E: 0.020080 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
     */
-    for finger in 0..fingers {
-        emit(&sink, ABS_MT_SLOT, finger)?;
-        emit(&sink, ABS_MT_POSITION_X, x)?;
-        emit(&sink, ABS_MT_POSITION_Y, y)?;
-    }
-    sync(&sink)?;
 
+    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_possible_truncation)]
+    let x = ((x as f32) * x_mult) as i32;
+    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_possible_truncation)]
+    let y = ((y as f32) * y_mult) as i32;
+
+    for finger in 0..fingers {
+        emit(dev, ABS_MT_SLOT, finger)?;
+        emit(dev, ABS_MT_POSITION_X, x)?;
+        emit(dev, ABS_MT_POSITION_Y, y)?;
+    }
+    sync(dev)?;
+
+    Ok(())
+}
+
+fn stop_swipe(
+    source: &mut Device,
+    sink: &UInputDevice,
+    fingers: i32,
+    btn_tool: EV_KEY,
+    grab: bool,
+) -> Result<()> {
+    /*
+    E: 2.992985 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
+    E: 3.000143 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
+    E: 3.000143 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
+    E: 3.000143 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
+    E: 3.000143 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
+    E: 3.000143 0001 0145 0001	# EV_KEY / BTN_TOOL_FINGER      1
+    E: 3.000143 0001 014e 0000	# EV_KEY / BTN_TOOL_TRIPLETAP   0
+    E: 3.000143 0004 0005 2942200	# EV_MSC / MSC_TIMESTAMP        2942200
+    E: 3.000143 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +8ms
+    E: 3.007174 0003 002f 0000	# EV_ABS / ABS_MT_SLOT          0
+    E: 3.007174 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
+    E: 3.007174 0001 014a 0000	# EV_KEY / BTN_TOUCH            0
+    E: 3.007174 0001 0145 0000	# EV_KEY / BTN_TOOL_FINGER      0
+    E: 3.007174 0004 0005 2948400	# EV_MSC / MSC_TIMESTAMP        2948400
+    E: 3.007174 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
+    */
+
+    for finger in 0..fingers {
+        emit(sink, ABS_MT_SLOT, finger)?;
+        emit(sink, ABS_MT_TRACKING_ID, -1)?;
+    }
+    emit(sink, BTN_TOOL_FINGER, 0)?;
+    emit(sink, btn_tool, 0)?;
+    sync(sink)?;
+
+    if grab && source.grab(GrabMode::Ungrab).is_err() {
+        warn!("Failed to ungrab source device, will still stop swiping");
+    }
+
+    debug!("Stopped swiping");
     Ok(())
 }

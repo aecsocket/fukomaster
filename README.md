@@ -41,7 +41,7 @@ Tested on:
 - [ ] Xorg
   - TODO
 
-This tool must be run as `sudo`, since it needs to read raw mouse inputs from your physical mouse.
+This tool must be run as root, since it needs to read raw mouse inputs from your physical mouse.
 
 **If using [Solaar],** the *Key/Button Diversion* for the *Mouse Gesture Button* must be set to
 *Regular*, so that this tool can read the mouse gesture button being pressed/released.
@@ -49,6 +49,8 @@ This tool must be run as `sudo`, since it needs to read raw mouse inputs from yo
 This tool uses `evdev`'s grab functionality, which allows a process to temporarily lock a device's
 inputs so that only that process can consume them, and other processes do not read the events.
 **This may cause some issues with other processes which also grab!**
+
+This tool is very customizable - see the `--help` for all the command line flags.
 
 ### Packages
 
