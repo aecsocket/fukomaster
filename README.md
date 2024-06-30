@@ -5,7 +5,7 @@ Simulate a trackpad with your physical mouse.
 <center>
 
 <video width="640" height="360" controls>
-  <source src="assets/demo.mp4" type="video/mp4">
+  <source src="https://github.com/aecsocket/fukomaster/assets/43144841/0fffaa5c-bc8e-433e-a646-18f050679336" type="video/mp4">
 </video>
 
 *Using fukomaster with an MX Master 3S on GNOME with the
