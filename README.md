@@ -52,4 +52,4 @@ cargo run
 ## Etymology
 
 - `master`: because I wrote it for my MX Master 3S
-- `fuko`: [:)](https://steamcommunity.com/stats/324160/achievements)
+- `fuko`: iykyk :)
