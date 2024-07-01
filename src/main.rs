@@ -1,26 +1,23 @@
 #![doc = include_str!("../README.md")]
 
-// mod util;
+mod states;
+mod swipe;
 
 use std::{
-    collections::hash_map::Entry,
     fs,
-    os::unix::fs::{FileTypeExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use ahash::AHashMap;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 
 use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
-    AbsInfo, AbsoluteAxisType, AttributeSet, Device, EventStream, EventType, InputEvent,
-    InputEventKind, Key, PropType, UinputAbsSetup,
+    AbsInfo, AbsoluteAxisType, AttributeSet, Key, PropType, UinputAbsSetup,
 };
-use futures::{stream::FuturesUnordered, StreamExt};
-use log::{debug, error, info, warn};
+use futures::never::Never;
+use log::{debug, info, warn};
 use notify::Watcher;
 use tokio::sync::mpsc;
 
@@ -84,8 +81,6 @@ pub struct Args {
     #[arg(long)]
     pub no_grab: bool,
 }
-
-type Never = std::convert::Infallible;
 
 const DEV_INPUT: &str = "/dev/input";
 const VIRTUAL_DEVICE_NAME: &str = "fukomaster virtual trackpad";
@@ -193,7 +188,7 @@ async fn main() -> Result<Never> {
         info!("  dev node = {dev_node:?}");
     }
 
-    simulate_trackpad(
+    swipe::simulate(
         &mut recv_device_events,
         &mut sink,
         &input_allow,
@@ -327,8 +322,8 @@ fn create_trackpad(resolution: u16) -> Result<VirtualDevice> {
         ]))?
         .with_absolute_axis(&UinputAbsSetup::new(
             AbsoluteAxisType::ABS_MT_SLOT,
-            abs_with_max(4),
-        ))? // max 5 touches
+            abs_with_max(4), // max 5 touches
+        ))?
         .with_absolute_axis(&UinputAbsSetup::new(
             AbsoluteAxisType::ABS_MT_TRACKING_ID,
             abs_with_max(i32::MAX),
@@ -343,409 +338,4 @@ fn create_trackpad(resolution: u16) -> Result<VirtualDevice> {
         ))?
         .build()?;
     Ok(dev)
-}
-
-async fn simulate_trackpad(
-    device_events: &mut mpsc::UnboundedReceiver<DeviceEvent>,
-    sink: &mut VirtualDevice,
-    input_allow: &[PathBuf],
-    input_deny: &[PathBuf],
-    swipe_2: Option<Key>,
-    swipe_3: Option<Key>,
-    swipe_4: Option<Key>,
-    swipe_5: Option<Key>,
-    x_mult: f32,
-    y_mult: f32,
-    grab: bool,
-) -> Result<Never> {
-    enum State {
-        Normal,
-        Swiping { fingers: u8, x: i32, y: i32 },
-    }
-
-    impl State {
-        fn swiping(fingers: u8) -> Self {
-            Self::Swiping {
-                fingers,
-                x: 0,
-                y: 0,
-            }
-        }
-    }
-
-    let mut state = State::Normal;
-    let mut devices = AHashMap::<PathBuf, EventStream>::new();
-
-    loop {
-        let mut input_events = devices
-            .iter_mut()
-            .map(|(path, events)| async move {
-                let res = events.next_event().await;
-                (path, events.device_mut(), res)
-            })
-            .collect::<FuturesUnordered<_>>();
-
-        tokio::select! {
-            Some(event) = device_events.recv() => {
-                drop(input_events);
-                match event {
-                    DeviceEvent::Added(path) => {
-                        info!("Added {path:?}");
-                    }
-                    DeviceEvent::Removed(path) => {
-                        if let Some(events) = devices.remove(&path) {
-                            if let Some(name) = events.device().name() {
-                                info!("Removed {name:?} ({path:?})");
-                            } else {
-                                info!("Removed {path:?}");
-                            }
-                        }
-                    }
-                }
-            }
-            Some((path, device, input)) = input_events.next() => {
-                let input = match input {
-                    Ok(input) => input,
-                    Err(err) => {
-                        warn!(
-                            "Failed to read events from {path:?}: {:#}",
-                            anyhow::Error::new(err)
-                        );
-                        continue;
-                    }
-                };
-
-                match state {
-                    State::Normal => {
-                        let mut try_start_swipe = |trigger: Option<Key>, fingers, btn_tool| -> Result<()> {
-                            if trigger
-                                .map(|key| input.kind() == InputEventKind::Key(key))
-                                .unwrap_or(false)
-                                && input.value() == 1
-                            {
-                                if grab {
-                                    if let Err(err) = device.grab() {
-                                        warn!(
-                                            "Failed to grab {path:?}, will not start swiping: {:#}",
-                                            anyhow::Error::new(err)
-                                        );
-                                        return Ok(());
-                                    }
-                                }
-
-                                start_swipe(sink, fingers, btn_tool)?;
-                                info!("Start swipe with {fingers} fingers on {path:?}");
-                                state = State::Swiping {
-                                    fingers,
-                                    x: 0,
-                                    y: 0,
-                                };
-                            }
-                            Ok(())
-                        };
-
-                        try_start_swipe(swipe_2, 2, Key::BTN_TOOL_DOUBLETAP)?;
-                        try_start_swipe(swipe_3, 3, Key::BTN_TOOL_TRIPLETAP)?;
-                        try_start_swipe(swipe_4, 4, Key::BTN_TOOL_QUADTAP)?;
-                        try_start_swipe(swipe_5, 5, Key::BTN_TOOL_QUINTTAP)?;
-                    }
-                    State::Swiping { fingers, x, y } => {}
-                }
-            }
-        }
-
-        // match (state, input) {
-        //     (State::Normal, event) if matches!(event.kind(), InputEventKind::Key(key)) => {}
-        //     (State::Normal, event)
-        //         if swipe_3.map(|key| event.kind() == InputEventKind::Key(key))(
-        //             State::Normal | State::Swiping { .. },
-        //             _,
-        //         ) => {}
-        // }
-    }
-
-    /*
-
-    loop {
-        tokio::select! {
-            event = recv_device_event.recv() => {
-                let Some(event) = event else {
-                    error!("{DEV_INPUT:?} watcher is closed - unable to read any more device changes");
-                    continue;
-                };
-
-                match event {
-                    DeviceEvent::Added(path) => add_device(path.clone(), &mut devices, sink_devnode, &input_allow, &input_deny)?,
-                    DeviceEvent::Removed(path) => {
-                        debug!("Received signal to remove {path:?}");
-                        if let Some(device) = devices.remove(&path) {
-                            if let Some(name) = device.name() {
-                                info!("Removed {name:?} ({path:?})");
-                            } else {
-                                info!("Removed {path:?}");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }*/
-}
-
-/*
-fn add_device(
-    path: PathBuf,
-    devices: &mut AHashMap<PathBuf, Device>,
-    sink_devnode: &str,
-    input_allow: &[PathBuf],
-    input_deny: &[PathBuf],
-) -> Result<()> {
-    const DEVICE_PREFIX: &str = "event";
-
-    debug!("Received request to add {path:?}");
-
-    let path_str = path.to_str().with_context(|| "path is not UTF-8")?;
-    if sink_devnode == path_str {
-        debug!("  Rejected: this is our own sink device");
-        return Ok(());
-    }
-
-    let file_name = path
-        .file_name()
-        .with_context(|| "path does not have a file name")?
-        .to_str()
-        .with_context(|| "file name is not UTF-8")?;
-    if !file_name.starts_with(DEVICE_PREFIX) {
-        debug!("  Rejected: path does not start with {DEVICE_PREFIX:?}");
-        return Ok(());
-    }
-
-    if input_deny.contains(&path) {
-        debug!("  Rejected: path is in the deny list");
-        return Ok(());
-    }
-
-    if !input_allow.is_empty() && !input_allow.contains(&path) {
-        debug!("  Rejected: path is not in the allow list");
-        return Ok(());
-    }
-
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(&path)
-        .with_context(|| "failed to open device file")?;
-    let metadata = file
-        .metadata()
-        .with_context(|| "failed to read file metadata")?;
-    if !metadata.file_type().is_char_device() {
-        debug!("  Rejected: file is not a char device");
-        return Ok(());
-    }
-
-    let Entry::Vacant(entry) = devices.entry(path.clone()) else {
-        return Err(anyhow!("device {path:?} is already being tracked"));
-    };
-
-    let device =
-        Device::new_from_path(path.clone()).with_context(|| "failed to open device file")?;
-    let device = entry.insert(device);
-
-    if let Some(name) = device.name() {
-        info!("Added {name:?} ({path:?})");
-    } else {
-        info!("Added {path:?}");
-    }
-    Ok(())
-}*/
-
-/*
-#[derive(Debug, Clone, Copy)]
-struct Config {
-    fingers: i32,
-    trigger_key: EV_KEY,
-    btn_tool: EV_KEY,
-    x_mult: f32,
-    y_mult: f32,
-    grab: bool,
-    start_swiping: bool,
-}
-
-fn simulate_trackpad(source: &mut Device, sink: &UInputDevice, config: Config) -> Result<()> {
-    enum State {
-        Normal,
-        Swiping { x: i32, y: i32 },
-    }
-
-    impl State {
-        fn swiping() -> Self {
-            Self::Swiping { x: 0, y: 0 }
-        }
-    }
-
-    let Config {
-        fingers,
-        trigger_key,
-        btn_tool,
-        x_mult,
-        y_mult,
-        grab,
-        start_swiping,
-    } = config;
-
-    let mut state = if start_swiping {
-        start_swipe(source, sink, fingers, btn_tool, grab)
-            .with_context(|| "failed to start swipe")?;
-        State::swiping()
-    } else {
-        State::Normal
-    };
-
-    loop {
-        let (_, input) = source
-            .next_event(ReadFlag::NORMAL | ReadFlag::BLOCKING)
-            .with_context(|| "failed to read next event from source device")?;
-
-        match (&mut state, input.event_code, input.value) {
-            (State::Normal, EventCode::EV_KEY(key), 1) if key == trigger_key => {
-                start_swipe(source, sink, fingers, btn_tool, grab)
-                    .with_context(|| "failed to start swipe")?;
-                state = State::swiping();
-            }
-
-            (State::Swiping { .. }, EventCode::EV_KEY(key), 0) if key == trigger_key => {
-                stop_swipe(source, sink, fingers, btn_tool, grab)
-                    .with_context(|| "failed to stop swipe")?;
-                state = State::Normal;
-            }
-            (State::Swiping { ref mut x, y }, EventCode::EV_REL(REL_X), dx) => {
-                *x += dx;
-                update_position(sink, fingers, *x, x_mult, *y, y_mult)?;
-            }
-            (State::Swiping { x, ref mut y }, EventCode::EV_REL(REL_Y), dy) => {
-                *y += dy;
-                update_position(sink, fingers, *x, x_mult, *y, y_mult)?;
-            }
-
-            (State::Normal | State::Swiping { .. }, _, _) => {}
-        }
-    }
-}*/
-
-fn abs_event(axis_type: AbsoluteAxisType, value: i32) -> InputEvent {
-    InputEvent::new_now(EventType::ABSOLUTE, axis_type.0, value)
-}
-
-fn start_swipe(sink: &mut VirtualDevice, fingers: u8, btn_tool: Key) -> Result<()> {
-    /*
-    E: 0.000001 0003 0039 8661	# EV_ABS / ABS_MT_TRACKING_ID   8661
-    E: 0.000001 0003 0035 0690	# EV_ABS / ABS_MT_POSITION_X    690
-    E: 0.000001 0003 0036 0665	# EV_ABS / ABS_MT_POSITION_Y    665
-    E: 0.000001 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
-    E: 0.000001 0003 0039 8662	# EV_ABS / ABS_MT_TRACKING_ID   8662
-    E: 0.000001 0003 0035 0881	# EV_ABS / ABS_MT_POSITION_X    881
-    E: 0.000001 0003 0036 0306	# EV_ABS / ABS_MT_POSITION_Y    306
-    E: 0.000001 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
-    E: 0.000001 0003 0039 8663	# EV_ABS / ABS_MT_TRACKING_ID   8663
-    E: 0.000001 0003 0035 0679	# EV_ABS / ABS_MT_POSITION_X    679
-    E: 0.000001 0003 0036 0443	# EV_ABS / ABS_MT_POSITION_Y    443
-    E: 0.000001 0001 014a 0001	# EV_KEY / BTN_TOUCH            1
-    E: 0.000001 0001 014e 0001	# EV_KEY / BTN_TOOL_TRIPLETAP   1
-    E: 0.000001 0003 0000 0690	# EV_ABS / ABS_X                690
-    E: 0.000001 0003 0001 0665	# EV_ABS / ABS_Y                665
-    E: 0.000001 0004 0005 0000	# EV_MSC / MSC_TIMESTAMP        0
-    E: 0.000001 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +0ms
-    */
-
-    let events = (0..i32::from(fingers))
-        .flat_map(|finger| {
-            [
-                abs_event(AbsoluteAxisType::ABS_MT_SLOT, finger),
-                abs_event(AbsoluteAxisType::ABS_MT_TRACKING_ID, finger),
-                abs_event(AbsoluteAxisType::ABS_MT_POSITION_X, 0),
-                abs_event(AbsoluteAxisType::ABS_MT_POSITION_Y, 0),
-            ]
-        })
-        .chain([
-            InputEvent::new(EventType::KEY, Key::BTN_TOUCH.0, 1),
-            InputEvent::new(EventType::KEY, btn_tool.0, 1),
-        ]);
-
-    sink.emit(&events.collect::<Vec<_>>())?;
-    Ok(())
-}
-
-fn update_position(
-    sink: &mut VirtualDevice,
-    fingers: u8,
-    x: i32,
-    x_mult: f32,
-    y: i32,
-    y_mult: f32,
-) -> Result<()> {
-    /*
-    E: 0.020080 0003 002f 0000	# EV_ABS / ABS_MT_SLOT          0
-    E: 0.020080 0003 0035 0686	# EV_ABS / ABS_MT_POSITION_X    686
-    E: 0.020080 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
-    E: 0.020080 0003 0035 0878	# EV_ABS / ABS_MT_POSITION_X    878
-    E: 0.020080 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
-    E: 0.020080 0003 0035 0675	# EV_ABS / ABS_MT_POSITION_X    675
-    E: 0.020080 0003 0036 0442	# EV_ABS / ABS_MT_POSITION_Y    442
-    E: 0.020080 0003 0000 0686	# EV_ABS / ABS_X                686
-    E: 0.020080 0004 0005 21000	# EV_MSC / MSC_TIMESTAMP        21000
-    E: 0.020080 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
-    */
-
-    #[allow(clippy::cast_precision_loss)]
-    #[allow(clippy::cast_possible_truncation)]
-    let x = ((x as f32) * x_mult) as i32;
-    #[allow(clippy::cast_precision_loss)]
-    #[allow(clippy::cast_possible_truncation)]
-    let y = ((y as f32) * y_mult) as i32;
-
-    let events = (0..i32::from(fingers)).flat_map(|finger| {
-        [
-            abs_event(AbsoluteAxisType::ABS_MT_SLOT, finger),
-            abs_event(AbsoluteAxisType::ABS_MT_POSITION_X, x),
-            abs_event(AbsoluteAxisType::ABS_MT_POSITION_Y, y),
-        ]
-    });
-
-    sink.emit(&events.collect::<Vec<_>>())?;
-    Ok(())
-}
-
-fn stop_swipe(sink: &mut VirtualDevice, fingers: u8, btn_tool: Key) -> Result<()> {
-    /*
-    E: 2.992985 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
-    E: 3.000143 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
-    E: 3.000143 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
-    E: 3.000143 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
-    E: 3.000143 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
-    E: 3.000143 0001 0145 0001	# EV_KEY / BTN_TOOL_FINGER      1
-    E: 3.000143 0001 014e 0000	# EV_KEY / BTN_TOOL_TRIPLETAP   0
-    E: 3.000143 0004 0005 2942200	# EV_MSC / MSC_TIMESTAMP        2942200
-    E: 3.000143 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +8ms
-    E: 3.007174 0003 002f 0000	# EV_ABS / ABS_MT_SLOT          0
-    E: 3.007174 0003 0039 -001	# EV_ABS / ABS_MT_TRACKING_ID   -1
-    E: 3.007174 0001 014a 0000	# EV_KEY / BTN_TOUCH            0
-    E: 3.007174 0001 0145 0000	# EV_KEY / BTN_TOOL_FINGER      0
-    E: 3.007174 0004 0005 2948400	# EV_MSC / MSC_TIMESTAMP        2948400
-    E: 3.007174 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
-    */
-
-    let events = (0..i32::from(fingers))
-        .flat_map(|finger| {
-            [
-                abs_event(AbsoluteAxisType::ABS_MT_SLOT, finger),
-                abs_event(AbsoluteAxisType::ABS_MT_TRACKING_ID, -1),
-            ]
-        })
-        .chain([
-            InputEvent::new_now(EventType::KEY, Key::BTN_TOOL_FINGER.0, 0),
-            InputEvent::new_now(EventType::KEY, btn_tool.0, 0),
-        ]);
-
-    sink.emit(&events.collect::<Vec<_>>())?;
-    Ok(())
 }

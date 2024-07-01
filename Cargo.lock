@@ -276,7 +276,6 @@ dependencies = [
  "clap",
  "evdev",
  "futures",
- "libc",
  "log",
  "notify",
  "pretty_env_logger",
