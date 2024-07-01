@@ -2,8 +2,15 @@
 
 mod util;
 
-use std::{fs::File, io, path::PathBuf};
+use std::{
+    collections::hash_map::Entry,
+    ffi::OsStr,
+    fs, io,
+    os::unix::fs::{FileTypeExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+};
 
+use ahash::AHashMap;
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use evdev_rs::{
@@ -17,27 +24,48 @@ use evdev_rs::{
     Device, DeviceWrapper, GrabMode, ReadFlag, UInputDevice, UninitDevice,
 };
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
+use notify::Watcher;
+use tokio::sync::mpsc;
 use util::{emit, enable_abs, enable_key, sync, Abs};
 
 /// Simulate a trackpad with your physical mouse
+///
+/// When a certain key is pressed (i.e. the mouse gesture button on a mouse),
+/// this tool starts a virtual trackpad swipe, and converts mouse movements
+/// into finger movements on this virtual trackpad. When the same key is
+/// released, the trackpad swipe stops.
+///
+/// This tool works on `uinput` key codes. Use `wev` to test which button on
+/// your mouse you want to use for activation. For the MX Master 3S, the mouse
+/// gesture button has key code `277`.
 #[derive(Debug, Clone, clap::Parser)]
-struct Args {
-    /// Source device file to read mouse inputs from (e.g. `/dev/input/event1`)
-    #[arg(short, long)]
-    source: PathBuf,
-    /// `uinput` key code which activates swiping mode
+pub struct Args {
+    /// Input device files to read inputs from (e.g. `/dev/input/event1`)
     ///
-    /// When this is pressed, the swiping mode is activated. When this is
-    /// released, the swiping mode is deactivated.
+    /// Without this option, all devices under `/dev/input` will be read for
+    /// inputs. If this option is specified, only the given devices will be
+    /// read.
+    #[arg(short = 'i')]
+    pub input_allow: Vec<PathBuf>,
+    /// Input device files to *never* read inputs from (e.g. `/dev/input/event1`)
     ///
-    /// Use `wev` to test which button on your mouse you want to use for
-    /// activation. For the MX Master 3S, the value is `277`.
-    #[arg(short, long, default_value_t = 277)]
-    trigger_key: u32,
-    /// Number of fingers to simulate a swipe with
-    #[arg(short, long, default_value_t = 3)]
-    fingers: u8,
+    /// Any devices given under this option will never be read for inputs, even
+    /// if they appear in the `-i` list.
+    #[arg(short = 'I')]
+    pub input_deny: Vec<PathBuf>,
+    /// Key code which activates 2-finger swiping mode
+    #[arg(short = '2')]
+    pub swipe_2: Option<u32>,
+    /// Key code which activates 3-finger swiping mode
+    #[arg(short = '3', default_value = "277")]
+    pub swipe_3: Option<u32>,
+    /// Key code which activates 4-finger swiping mode
+    #[arg(short = '4')]
+    pub swipe_4: Option<u32>,
+    /// Key code which activates 5-finger swiping mode
+    #[arg(short = '5')]
+    pub swipe_5: Option<u32>,
     /// Resolution of the virtual trackpad
     ///
     /// A larger resolution means you have to move your mouse further to have
@@ -46,79 +74,141 @@ struct Args {
     /// The value is used directly as the resolution of the virtual `uinput`
     /// device.
     #[arg(short, long, default_value_t = 12)]
-    resolution: u16,
+    pub resolution: u16,
     /// Swipe speed multiplier on the X axis
     #[arg(short, long, default_value_t = 1.0)]
-    x_mult: f32,
+    pub x_mult: f32,
     /// Swipe speed multiplier on the Y axis
     #[arg(short, long, default_value_t = 1.0)]
-    y_mult: f32,
+    pub y_mult: f32,
     /// Disables grabbing the mouse cursor in `evdev` when swiping
     ///
     /// If grabbing is disabled, the mouse cursor will move with the virtual
     /// trackpad when swiping, but may resolve issues with other processes
     /// which also attempt to grab the mouse.
     #[arg(long)]
-    no_grab: bool,
-    /// Enter the swiping mode when the process starts
-    #[arg(long)]
-    start_swiping: bool,
+    pub no_grab: bool,
 }
 
-fn main() -> Result<()> {
+type Never = std::convert::Infallible;
+
+const DEV_INPUT: &str = "/dev/input";
+
+#[derive(Debug, Clone)]
+enum DeviceEvent {
+    Added(PathBuf),
+    Removed(PathBuf),
+}
+
+#[tokio::main]
+async fn main() -> Result<Never> {
     init_logging();
 
+    // arg parsing
+
     let Args {
-        source,
-        trigger_key,
-        fingers,
+        input_allow,
+        input_deny,
+        swipe_2,
+        swipe_3,
+        swipe_4,
+        swipe_5,
         resolution,
         x_mult,
         y_mult,
         no_grab,
-        start_swiping,
     } = Args::parse();
 
-    let trigger_key =
-        evdev_rs::enums::int_to_ev_key(trigger_key).ok_or(anyhow!("invalid trigger key code"))?;
-
-    let (fingers, btn_tool): (i32, _) = match fingers {
-        2 => (2, BTN_TOOL_DOUBLETAP),
-        3 => (3, BTN_TOOL_TRIPLETAP),
-        4 => (4, BTN_TOOL_QUADTAP),
-        5 => (5, BTN_TOOL_QUINTTAP),
-        _ => {
-            return Err(anyhow!("can only swipe with 2, 3, 4 or 5 fingers"));
-        }
+    let to_trigger_key = |code: Option<u32>, fingers| -> Result<Option<EV_KEY>> {
+        code.map(|code| {
+            evdev_rs::enums::int_to_ev_key(code)
+                .ok_or(anyhow!("invalid {fingers}-finger swipe trigger key"))
+        })
+        .transpose()
     };
+    let swipe_2 = to_trigger_key(swipe_2, 2)?;
+    let swipe_3 = to_trigger_key(swipe_3, 3)?;
+    let swipe_4 = to_trigger_key(swipe_4, 4)?;
+    let swipe_5 = to_trigger_key(swipe_5, 5)?;
 
-    info!("Starting virtual trackpad sourced from {source:?}");
+    let grab = !no_grab;
 
-    let mut source = open_device(source).with_context(|| "failed to open source device")?;
-    let sink =
-        create_virtual_trackpad(resolution).with_context(|| "failed to create virtual trackpad")?;
+    // setup
+
+    let (send_device_event, mut recv_device_event) = mpsc::unbounded_channel::<DeviceEvent>();
+
+    // first enumerate what devices we already have
+    // note that paths in DeviceEvents may not actually point to a device;
+    // it's the consumer's job to figure out if a path is actually for a device
+    // that we can use
+    for result in fs::read_dir(DEV_INPUT)
+        .with_context(|| format!("failed to list files under {DEV_INPUT:?}"))?
+    {
+        let entry = result.with_context(|| format!("failed to read file under {DEV_INPUT:?}"))?;
+        send_device_event
+            .send(DeviceEvent::Added(entry.path()))
+            .expect("channel should be open");
+    }
+
+    // then set up a watcher to watch for device changes
+    let mut dev_watcher = notify::recommended_watcher(move |res| match res {
+        Ok(notify::Event {
+            kind: notify::EventKind::Create(_),
+            paths,
+            ..
+        }) => {
+            for path in paths.into_iter() {
+                debug!("{path:?} created");
+                let _ = send_device_event.send(DeviceEvent::Added(path));
+            }
+        }
+        Ok(notify::Event {
+            kind: notify::EventKind::Remove(_),
+            paths,
+            ..
+        }) => {
+            for path in paths.into_iter() {
+                debug!("{path:?} removed");
+                let _ = send_device_event.send(DeviceEvent::Removed(path));
+            }
+        }
+        Ok(_) => {}
+        Err(err) => {
+            warn!(
+                "Error while watching {DEV_INPUT:?}: {:#}",
+                anyhow::Error::new(err)
+            );
+        }
+    })
+    .with_context(|| "failed to create watcher")?;
+
+    dev_watcher
+        .watch(Path::new(DEV_INPUT), notify::RecursiveMode::NonRecursive)
+        .with_context(|| format!("failed to start watching {DEV_INPUT:?}"))?;
+    info!("Watching {DEV_INPUT:?} for device changes");
+
+    let sink = create_trackpad(resolution).with_context(|| "failed to create virtual trackpad")?;
     // we need a slight delay after creating the input device
-    // so that other components can recognize it
+    // so that other processes (i.e. compositor) can recognize it
     std::thread::sleep(std::time::Duration::from_millis(200));
     info!("Created virtual trackpad");
-    info!("  devnode = {:?}", sink.devnode());
-    info!("  syspath = {:?}", sink.syspath());
+    info!("  devnode = {:?}", sink.devnode().unwrap());
+    info!("  syspath = {:?}", sink.syspath().unwrap());
 
     simulate_trackpad(
-        &mut source,
+        &mut recv_device_event,
         &sink,
-        Config {
-            fingers,
-            trigger_key,
-            btn_tool,
-            x_mult,
-            y_mult,
-            grab: !no_grab,
-            start_swiping,
-        },
-    )?;
-
-    Ok(())
+        &input_allow,
+        &input_deny,
+        swipe_2,
+        swipe_3,
+        swipe_4,
+        swipe_5,
+        x_mult,
+        y_mult,
+        grab,
+    )
+    .await
 }
 
 fn init_logging() {
@@ -128,13 +218,7 @@ fn init_logging() {
     builder.init();
 }
 
-fn open_device(path: PathBuf) -> Result<Device> {
-    // https://github.com/ndesh26/evdev-rs/blob/master/examples/vmouse.rs
-    let file = File::open(path).with_context(|| "failed to open device file")?;
-    Device::new_from_file(file).with_context(|| "failed to create device from file")
-}
-
-fn create_virtual_trackpad(resolution: u16) -> Result<UInputDevice> {
+fn create_trackpad(resolution: u16) -> Result<UInputDevice> {
     /*
     # Supported events:
     #   Event type 0 (EV_SYN)
@@ -266,6 +350,132 @@ fn create_virtual_trackpad(resolution: u16) -> Result<UInputDevice> {
     Ok(dev)
 }
 
+async fn simulate_trackpad(
+    recv_device_event: &mut mpsc::UnboundedReceiver<DeviceEvent>,
+    sink: &UInputDevice,
+    input_allow: &[PathBuf],
+    input_deny: &[PathBuf],
+    swipe_2: Option<EV_KEY>,
+    swipe_3: Option<EV_KEY>,
+    swipe_4: Option<EV_KEY>,
+    swipe_5: Option<EV_KEY>,
+    x_mult: f32,
+    y_mult: f32,
+    grab: bool,
+) -> Result<Never> {
+    enum State {
+        Normal,
+        Swiping { x: i32, y: i32 },
+    }
+
+    impl State {
+        fn swiping() -> Self {
+            Self::Swiping { x: 0, y: 0 }
+        }
+    }
+
+    let sink_devnode = sink
+        .devnode()
+        .with_context(|| "sink does not have a devnode")?;
+
+    let mut state = State::Normal;
+    let mut devices = AHashMap::<PathBuf, Device>::new();
+
+    let futures = devices.iter().map(|(_, dev)| dev.file())
+
+    loop {
+        tokio::select! {
+            event = recv_device_event.recv() => {
+                let Some(event) = event else {
+                    error!("{DEV_INPUT:?} watcher is closed - unable to read any more device changes");
+                    continue;
+                };
+
+                match event {
+                    DeviceEvent::Added(path) => add_device(path.clone(), &mut devices, sink_devnode, &input_allow, &input_deny)?,
+                    DeviceEvent::Removed(path) => {
+                        debug!("Received signal to remove {path:?}");
+                        if let Some(device) = devices.remove(&path) {
+                            if let Some(name) = device.name() {
+                                info!("Removed {name:?} ({path:?})");
+                            } else {
+                                info!("Removed {path:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn add_device(
+    path: PathBuf,
+    devices: &mut AHashMap<PathBuf, Device>,
+    sink_devnode: &str,
+    input_allow: &[PathBuf],
+    input_deny: &[PathBuf],
+) -> Result<()> {
+    const DEVICE_PREFIX: &str = "event";
+
+    debug!("Received request to add {path:?}");
+
+    let path_str = path.to_str().with_context(|| "path is not UTF-8")?;
+    if sink_devnode == path_str {
+        debug!("  Rejected: this is our own sink device");
+        return Ok(());
+    }
+
+    let file_name = path
+        .file_name()
+        .with_context(|| "path does not have a file name")?
+        .to_str()
+        .with_context(|| "file name is not UTF-8")?;
+    if !file_name.starts_with(DEVICE_PREFIX) {
+        debug!("  Rejected: path does not start with {DEVICE_PREFIX:?}");
+        return Ok(());
+    }
+
+    if input_deny.contains(&path) {
+        debug!("  Rejected: path is in the deny list");
+        return Ok(());
+    }
+
+    if !input_allow.is_empty() && !input_allow.contains(&path) {
+        debug!("  Rejected: path is not in the allow list");
+        return Ok(());
+    }
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+        .with_context(|| "failed to open device file")?;
+    let metadata = file
+        .metadata()
+        .with_context(|| "failed to read file metadata")?;
+    if !metadata.file_type().is_char_device() {
+        debug!("  Rejected: file is not a char device");
+        return Ok(());
+    }
+
+    let Entry::Vacant(entry) = devices.entry(path.clone()) else {
+        return Err(anyhow!("device {path:?} is already being tracked"));
+    };
+
+    let device =
+        Device::new_from_path(path.clone()).with_context(|| "failed to open device file")?;
+    let device = entry.insert(device);
+
+    if let Some(name) = device.name() {
+        info!("Added {name:?} ({path:?})");
+    } else {
+        info!("Added {path:?}");
+    }
+    Ok(())
+}
+
+/*
 #[derive(Debug, Clone, Copy)]
 struct Config {
     fingers: i32,
@@ -463,3 +673,4 @@ fn stop_swipe(
     debug!("Stopped swiping");
     Ok(())
 }
+*/

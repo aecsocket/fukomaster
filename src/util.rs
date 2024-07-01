@@ -1,5 +1,6 @@
 use std::{io, time::SystemTime};
 
+use anyhow::Result;
 use evdev_rs::{
     enums::{EventCode, EV_ABS, EV_KEY, EV_SYN},
     AbsInfo, DeviceWrapper, EnableCodeData, InputEvent, TimeVal, UInputDevice, UninitDevice,
