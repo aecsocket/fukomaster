@@ -41,9 +41,9 @@ pub enum State {
     Swiping(Swiping),
 }
 
-impl State {
-    pub fn new() -> Normal {
-        Normal(())
+impl Default for State {
+    fn default() -> Self {
+        Self::Normal(Normal::new())
     }
 }
 
@@ -57,11 +57,16 @@ impl From<Normal> for State {
 }
 
 impl Normal {
+    pub fn new() -> Self {
+        Self(())
+    }
+
     pub fn start_swiping(
         self,
-        input_path: PathBuf,
+        source_path: PathBuf,
         source: &mut Device,
         sink: &mut VirtualDevice,
+        trigger: Key,
         fingers: Fingers,
         grab: bool,
     ) -> Result<Swiping> {
@@ -107,8 +112,9 @@ impl Normal {
         sink.emit(&events.collect::<Vec<_>>())?;
 
         Ok(Swiping {
-            input_path,
+            input_path: source_path,
             fingers,
+            trigger,
             x: 0,
             y: 0,
         })
@@ -118,6 +124,7 @@ impl Normal {
 #[derive(Debug)]
 pub struct Swiping {
     pub input_path: PathBuf,
+    pub trigger: Key,
     pub fingers: Fingers,
     pub x: i32,
     pub y: i32,
