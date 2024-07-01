@@ -64,7 +64,14 @@ TODO
 ### Compile from source
 
 ```bash
-cargo run
+cargo build
+sudo target/debug/fukomaster
+```
+
+To enable logging, use `sudo -E` to pass in the `RUST_LOG` env var:
+
+```bash
+RUST_LOG=trace sudo -E target/debug/fukomaster
 ```
 
 ## Etymology

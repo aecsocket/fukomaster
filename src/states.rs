@@ -12,7 +12,7 @@ pub enum Fingers {
 }
 
 impl Fingers {
-    pub fn count(&self) -> u8 {
+    pub fn count(self) -> u8 {
         match self {
             Self::Two => 2,
             Self::Three => 3,
@@ -21,7 +21,7 @@ impl Fingers {
         }
     }
 
-    pub fn btn_tool(&self) -> Key {
+    pub fn btn_tool(self) -> Key {
         match self {
             Self::Two => Key::BTN_TOOL_DOUBLETAP,
             Self::Three => Key::BTN_TOOL_TRIPLETAP,
@@ -61,6 +61,7 @@ impl Normal {
         Self(())
     }
 
+    #[allow(clippy::unused_self)]
     pub fn start_swiping(
         self,
         source_path: PathBuf,

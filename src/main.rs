@@ -141,7 +141,7 @@ async fn main() -> Result<Never> {
             paths,
             ..
         }) => {
-            for path in paths.into_iter() {
+            for path in paths {
                 debug!("{path:?} created");
                 let _ = send_device_events.send(DeviceEvent::Added(path));
             }
@@ -151,7 +151,7 @@ async fn main() -> Result<Never> {
             paths,
             ..
         }) => {
-            for path in paths.into_iter() {
+            for path in paths {
                 debug!("{path:?} removed");
                 let _ = send_device_events.send(DeviceEvent::Removed(path));
             }
@@ -206,7 +206,7 @@ async fn main() -> Result<Never> {
 
 fn init_logging() {
     let mut builder = pretty_env_logger::formatted_timed_builder();
-    builder.filter_level(log::LevelFilter::Trace);
+    builder.filter_level(log::LevelFilter::Info);
     builder.parse_default_env();
     builder.init();
 }
