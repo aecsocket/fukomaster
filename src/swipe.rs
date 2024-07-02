@@ -49,25 +49,36 @@ pub async fn simulate(
             })
             .collect::<FuturesUnordered<_>>();
 
-        tokio::select! {
+        state = tokio::select! {
             Some(event) = device_events.recv() => {
                 drop(input_events);
-                state = on_device_event(event, sink, &sink_dev_nodes, input_allow, input_deny, &mut devices, state)?;
+                on_device_event(
+                    event,
+                    sink,
+                    &sink_dev_nodes,
+                    input_allow,
+                    input_deny,
+                    &mut devices,
+                    state,
+                )?
             }
             Some((source_path, source, input)) = input_events.next() => {
-                let input = match input {
-                    Ok(input) => input,
-                    Err(err) => {
-                        warn!(
-                            "Failed to read events from {source_path:?}: {:#}",
-                            anyhow::Error::new(err)
-                        );
-                        continue;
-                    }
-                };
-                state = on_input_event(swipe_2, swipe_3, swipe_4, swipe_5, x_mult, y_mult, grab, source, source_path, sink, input, state)?;
+                on_input_event(
+                    swipe_2,
+                    swipe_3,
+                    swipe_4,
+                    swipe_5,
+                    x_mult,
+                    y_mult,
+                    grab,
+                    source,
+                    source_path,
+                    sink,
+                    input,
+                    state,
+                )?
             }
-        }
+        };
     }
 }
 
@@ -186,9 +197,26 @@ fn on_input_event(
     source: &mut Device,
     source_path: &PathBuf,
     sink: &mut VirtualDevice,
-    input: InputEvent,
+    input: Result<InputEvent, std::io::Error>,
     state: State,
 ) -> Result<State> {
+    if !source_path.exists() {
+        // this device has been removed, but notify hasn't told us about it yet
+        debug!("Received event from {source_path:?} which no longer exists");
+        return Ok(state);
+    }
+
+    let input = match input {
+        Ok(input) => input,
+        Err(err) => {
+            warn!(
+                "Failed to read events from {source_path:?}: {:#}",
+                anyhow::Error::new(err)
+            );
+            return Ok(state);
+        }
+    };
+
     Ok(match state {
         State::Normal(normal) => {
             struct StartInfo {
