@@ -31,7 +31,7 @@ pub async fn simulate(
     grab: bool,
 ) -> Result<Never> {
     info!("Creating virtual trackpad");
-    let (mut sink, mut sink_dev_nodes) = create_trackpad(resolution).await?;
+    let (mut sink, sink_dev_nodes) = create_trackpad(resolution).await?;
     let mut state = State::default();
     let mut devices = AHashMap::<PathBuf, EventStream>::new();
 
@@ -50,12 +50,12 @@ pub async fn simulate(
                 on_device_event(
                     event,
                     &mut sink,
-                    &mut sink_dev_nodes,
+                    &sink_dev_nodes,
                     input_allow,
                     input_deny,
                     &mut devices,
                     state
-                ).await?
+                )?
             }
             Some((source_path, source, input)) = input_events.next() => {
                 on_input_event(
@@ -235,10 +235,10 @@ async fn collect_dev_nodes(device: &mut VirtualDevice) -> Result<Vec<PathBuf>> {
     Ok(nodes)
 }
 
-async fn on_device_event(
+fn on_device_event(
     event: NotifyEvent,
     sink: &mut VirtualDevice,
-    sink_dev_nodes: &mut Vec<PathBuf>,
+    sink_dev_nodes: &[PathBuf],
     input_allow: &[PathBuf],
     input_deny: &[PathBuf],
     devices: &mut AHashMap<PathBuf, EventStream>,
