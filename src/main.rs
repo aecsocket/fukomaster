@@ -84,7 +84,6 @@ const DEV_INPUT: &str = "/dev/input";
 enum NotifyEvent {
     Created(PathBuf),
     Removed(PathBuf),
-    Access(PathBuf),
 }
 
 #[tokio::main]
@@ -150,16 +149,6 @@ async fn main() -> Result<Never> {
             for path in paths {
                 debug!("{path:?} removed");
                 let _ = send_notifs.send(NotifyEvent::Removed(path));
-            }
-        }
-        Ok(notify::Event {
-            kind: notify::EventKind::Access(_),
-            paths,
-            ..
-        }) => {
-            for path in paths {
-                debug!("{path:?} accessed");
-                let _ = send_notifs.send(NotifyEvent::Access(path));
             }
         }
         Ok(_) => {}

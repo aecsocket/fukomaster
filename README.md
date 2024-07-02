@@ -59,7 +59,7 @@ This tool is very customizable - see the `--help` for all the command line flags
 
 ### Packages
 
-TODO
+TODO - probably need to package this as a systemd service. Could upload to AUR?
 
 ### Compile from source
 

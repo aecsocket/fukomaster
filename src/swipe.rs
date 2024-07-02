@@ -32,7 +32,6 @@ pub async fn simulate(
 ) -> Result<Never> {
     info!("Creating virtual trackpad");
     let (mut sink, mut sink_dev_nodes) = create_trackpad(resolution).await?;
-    let mut old_sink_dev_nodes = Vec::new();
     let mut state = State::default();
     let mut devices = AHashMap::<PathBuf, EventStream>::new();
 
@@ -52,12 +51,10 @@ pub async fn simulate(
                     event,
                     &mut sink,
                     &mut sink_dev_nodes,
-                    &mut old_sink_dev_nodes,
                     input_allow,
                     input_deny,
-                    resolution,
                     &mut devices,
-                    state,
+                    state
                 ).await?
             }
             Some((source_path, source, input)) = input_events.next() => {
@@ -242,10 +239,8 @@ async fn on_device_event(
     event: NotifyEvent,
     sink: &mut VirtualDevice,
     sink_dev_nodes: &mut Vec<PathBuf>,
-    old_sink_dev_nodes: &mut Vec<PathBuf>,
     input_allow: &[PathBuf],
     input_deny: &[PathBuf],
-    resolution: u16,
     devices: &mut AHashMap<PathBuf, EventStream>,
     state: State,
 ) -> Result<State> {
@@ -296,65 +291,6 @@ async fn on_device_event(
                 }
                 state => state,
             }
-        }),
-        NotifyEvent::Access(path) => Ok({
-            // I've noticed that when some devices are modified in certain ways,
-            // specifically I close my laptop lid while still connected to
-            // external monitors, the virtual trackpad seems to stop working.
-            // We can still write into it, and `cat /dev/input/[virtual dev]`
-            // still shows inputs being written into it, but the compositor
-            // (specifically GNOME 46's Mutter) seems to stop doing any trackpad
-            // gestures (maybe closing the laptop lid causes the trackpad to
-            // also be disconnected, and that breaks this code?)
-            //
-            // When this happens, inotify sends out the events:
-            // - CLOSE_WRITE for our virtual trackpad
-            // - CLOSE_WRITE for my laptop's physical trackpad
-            //   - But note, the devnode is *not deleted!*
-            //
-            // Here, we detect any access changes and recreate the trackpad when
-            // that happens.
-            //
-            // Note that we can't just listen for when CLOSE_WRITE happens on
-            // our trackpad, and only then remake it, since:
-            // - another process could open and close our virtual device for
-            //   writing
-            // - when creating the uinput device, we also receive a CLOSE_WRITE
-            //   inotify (for some reason)
-            //
-            // Instead, we'll just listen for *any other device* being
-            // accessed, and then remake the trackpad.
-            //
-            // This is stupid.
-            //
-            // To make it even stupider, when we remake the trackpad, we might
-            // receive access events for the old trackpad. So we *also* keep
-            // around the devnodes of the old device, so we can explicitly
-            // ignore them.
-            // TODO will this cause issues if a new device reuses the devnode?
-            //
-            // MORE RESEARCH: This isn't a bug in my code, it's a bug in some
-            // lower-level component:
-            // - Present in both GNOME 46 and Plasma 6.1
-            // - Can still read from /dev/input/[virtual dev], so it's probably
-            //   not a kernel bug
-            // - Maybe wlroots or something? Or libinput stops reading from the
-            // touchpad when the lid closes, but it forgets that there can be
-            // multiple touchpads?
-            // Tested it with a PS4 controller and when I closed the laptop lid,
-            // the controller trackpad also died
-
-            if !sink_dev_nodes.contains(&path) && !old_sink_dev_nodes.contains(&path) {
-                info!("Creating new virtual trackpad because {path:?} was opened/closed");
-                let (new_sink, new_sink_dev_nodes) = create_trackpad(resolution)
-                    .await
-                    .with_context(|| "failed to recreate virtual trackpad")?;
-                *sink = new_sink;
-                // what the fuck is this naming?
-                let new_old_sink_dev_nodes = std::mem::replace(sink_dev_nodes, new_sink_dev_nodes);
-                *old_sink_dev_nodes = new_old_sink_dev_nodes;
-            }
-            state
         }),
     }
 }
