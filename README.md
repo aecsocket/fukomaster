@@ -40,11 +40,7 @@ can't, for example, simulate a pinch-and-zoom.
 
 ## Usage
 
-Tested on:
-- [x] Wayland
-  - [x] GNOME 46
-- [ ] Xorg
-  - TODO
+Tested on Wayland using GNOME 46, 47, 48. This tool does not provide explicit support for X11. KDE support may or may not work.
 
 This tool must be run as root, since it needs to read raw mouse inputs from your physical mouse.
 
@@ -57,10 +53,6 @@ inputs so that only that process can consume them, and other processes do not re
 
 This tool is very customizable - see the `--help` for all the command line flags.
 
-### Packages
-
-TODO - probably need to package this as a systemd service. Could upload to AUR?
-
 ### Compile from source
 
 ```bash
@@ -72,6 +64,32 @@ To enable logging, use `sudo -E` to pass in the `RUST_LOG` env var:
 
 ```bash
 RUST_LOG=trace sudo -E target/debug/fukomaster
+```
+
+### Packages
+
+This tool is currently not available on any package managers, and I don't have the knowledge or time to package it. You will have to install it manually.
+
+1. Build the tool
+
+```bash
+cargo build --release
+sudo cp target/release/fukomaster /usr/local/bin/
+```
+
+2. Write a systemd unit for it
+
+`/etc/systemd/system/fukomaster.service`
+```ini
+[Unit]
+Description=fukomaster
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fukomaster -r 25
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ## Etymology
