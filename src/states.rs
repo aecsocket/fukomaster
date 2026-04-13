@@ -147,12 +147,7 @@ impl Swiping {
         self.pending_dy += dy;
     }
 
-    pub fn flush(
-        &mut self,
-        sink: &mut VirtualDevice,
-        x_mult: f32,
-        y_mult: f32,
-    ) -> Result<()> {
+    pub fn flush(&mut self, sink: &mut VirtualDevice, x_mult: f32, y_mult: f32) -> Result<()> {
         if self.pending_dx == 0 && self.pending_dy == 0 {
             return Ok(());
         }
