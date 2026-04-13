@@ -118,6 +118,8 @@ impl Normal {
             trigger,
             x: 0,
             y: 0,
+            pending_dx: 0,
+            pending_dy: 0,
         })
     }
 }
@@ -129,6 +131,8 @@ pub struct Swiping {
     pub fingers: Fingers,
     pub x: i32,
     pub y: i32,
+    pending_dx: i32,
+    pending_dy: i32,
 }
 
 impl From<Swiping> for State {
@@ -138,29 +142,20 @@ impl From<Swiping> for State {
 }
 
 impl Swiping {
-    pub fn update(
-        &mut self,
-        sink: &mut VirtualDevice,
-        dx: i32,
-        dy: i32,
-        x_mult: f32,
-        y_mult: f32,
-    ) -> Result<()> {
-        self.x += dx;
-        self.y += dy;
+    pub fn accumulate(&mut self, dx: i32, dy: i32) {
+        self.pending_dx += dx;
+        self.pending_dy += dy;
+    }
 
-        /*
-        E: 0.020080 0003 002f 0000	# EV_ABS / ABS_MT_SLOT          0
-        E: 0.020080 0003 0035 0686	# EV_ABS / ABS_MT_POSITION_X    686
-        E: 0.020080 0003 002f 0001	# EV_ABS / ABS_MT_SLOT          1
-        E: 0.020080 0003 0035 0878	# EV_ABS / ABS_MT_POSITION_X    878
-        E: 0.020080 0003 002f 0002	# EV_ABS / ABS_MT_SLOT          2
-        E: 0.020080 0003 0035 0675	# EV_ABS / ABS_MT_POSITION_X    675
-        E: 0.020080 0003 0036 0442	# EV_ABS / ABS_MT_POSITION_Y    442
-        E: 0.020080 0003 0000 0686	# EV_ABS / ABS_X                686
-        E: 0.020080 0004 0005 21000	# EV_MSC / MSC_TIMESTAMP        21000
-        E: 0.020080 0000 0000 0000	# ------------ SYN_REPORT (0) ---------- +7ms
-        */
+    pub fn flush(&mut self, sink: &mut VirtualDevice, x_mult: f32, y_mult: f32) -> Result<()> {
+        if self.pending_dx == 0 && self.pending_dy == 0 {
+            return Ok(());
+        }
+
+        self.x += self.pending_dx;
+        self.y += self.pending_dy;
+        self.pending_dx = 0;
+        self.pending_dy = 0;
 
         #[allow(clippy::cast_precision_loss)]
         #[allow(clippy::cast_possible_truncation)]

@@ -402,15 +402,17 @@ fn on_input_event(
         }
         State::Swiping(mut swiping) => match input.kind() {
             InputEventKind::RelAxis(RelativeAxisType::REL_X) => {
-                swiping
-                    .update(sink, input.value(), 0, x_mult, y_mult)
-                    .with_context(|| "failed to update swipe position")?;
+                swiping.accumulate(input.value(), 0);
                 swiping.into()
             }
             InputEventKind::RelAxis(RelativeAxisType::REL_Y) => {
+                swiping.accumulate(0, input.value());
+                swiping.into()
+            }
+            InputEventKind::Synchronization(evdev::Synchronization::SYN_REPORT) => {
                 swiping
-                    .update(sink, 0, input.value(), x_mult, y_mult)
-                    .with_context(|| "failed to update swipe position")?;
+                    .flush(sink, x_mult, y_mult)
+                    .with_context(|| "failed to flush swipe position")?;
                 swiping.into()
             }
             InputEventKind::Key(key) if key == swiping.trigger && input.value() == 0 => {
